@@ -87,6 +87,51 @@ class WatchGroup(
         )
 
 
+class TestGroup(
+    app_commands.Group,
+    name="test",
+    description="動作確認用: 定期実行を待たずにすぐ動かします",
+    default_permissions=discord.Permissions(manage_guild=True),
+):
+    @app_commands.command(name="proposal", description="ニュース収集〜提案の投稿を今すぐ実行します")
+    async def proposal(self, interaction: discord.Interaction) -> None:
+        bot = interaction.client
+        if bot._proposal_lock.locked():
+            await interaction.response.send_message("⏳ 提案ジョブはすでに実行中です。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)  # ニュース収集と Jev 判定に数十秒かかる
+        async with bot._proposal_lock:
+            try:
+                stats = await bot.run_proposal_job(await db.get_all_settings())
+            except Exception as exc:
+                await interaction.followup.send(f"⚠️ 提案ジョブでエラーが発生しました: `{exc}`", ephemeral=True)
+                raise
+        text = (
+            f"✅ 提案ジョブを実行しました\n"
+            f"ニュース {stats['news']} 件 → 銘柄が見つかった候補 {stats['candidates']} 件 → "
+            f"Jev 判定 {stats['judged']} 件 → しきい値通過 {stats['passed']} 件 → 投稿 {stats['posted']} 件"
+        )
+        if stats["posted"] == 0:
+            text += "\n（直近 3 日以内に提案済み・監視中の銘柄は除外しています）"
+        await interaction.followup.send(text, ephemeral=True)
+
+    @app_commands.command(name="signal", description="指定した銘柄のチャート付き通知を、シグナルの有無に関係なく送ります")
+    @app_commands.describe(code="証券コード（例: 7203）")
+    async def signal(self, interaction: discord.Interaction, code: str) -> None:
+        code = normalize_code(code)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        info = interaction.client.master.get(code)
+        name = info.name if info else await market.lookup_listed_name(code)
+        if name is None:
+            await interaction.followup.send(f"❌ 証券コード `{code}` の上場銘柄は見つかりませんでした。", ephemeral=True)
+            return
+        if not await interaction.client.send_test_signal(code, name):
+            await interaction.followup.send(f"⚠️ {name} ({code}) の株価データを取得できませんでした。", ephemeral=True)
+            return
+        await interaction.followup.send(f"✅ {name} ({code}) のテスト通知を送りました。", ephemeral=True)
+
+
 def setup(tree: app_commands.CommandTree) -> None:
     tree.add_command(settings_command)
     tree.add_command(WatchGroup())
+    tree.add_command(TestGroup())

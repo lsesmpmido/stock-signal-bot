@@ -202,7 +202,8 @@ class StockBot(ext_commands.Bot):
 
     # ------------------------------------------------------------ モジュール1・2: 新銘柄提案
 
-    async def run_proposal_job(self, settings: dict[str, str]) -> None:
+    async def run_proposal_job(self, settings: dict[str, str]) -> dict[str, int]:
+        """ニュースを判定して提案を投稿し、各段階の件数を返す（/test proposal の結果表示に使う）。"""
         items = await news.fetch_news()
         skip = {s["ticker"] for s in await db.list_monitored()} | await db.recently_proposed_tickers(
             PROPOSAL_DEDUP_DAYS
@@ -234,12 +235,14 @@ class StockBot(ext_commands.Bot):
         log.info("Jev 判定通過: %d / %d 件", len(passed), len(results))
 
         channel = await self._channel("DISCORD_CHANNEL_PROPOSAL")
+        posted = 0
         for item, info, judgement in passed[:MAX_PROPOSALS_PER_RUN]:
             pending_id = await db.add_pending(
                 info.code, info.name, item.title, item.url, judgement.is_positive, judgement.impact
             )
             if pending_id is None:
                 continue
+            posted += 1
             embed = discord.Embed(
                 title=f"📰 {info.name} ({info.code})",
                 description=f"[{item.title}]({item.url})" + (f"\n— {item.source}" if item.source else ""),
@@ -249,6 +252,13 @@ class StockBot(ext_commands.Bot):
             embed.add_field(name="インパクト", value=f"{judgement.impact:.2f} / 2")
             embed.add_field(name="市場・業種", value=f"{info.market}\n{info.sector}")
             await channel.send(embed=embed, view=views.proposal_view(pending_id, info.code))
+        return {
+            "news": len(items),
+            "candidates": len(candidates),
+            "judged": len(results),
+            "passed": len(passed),
+            "posted": posted,
+        }
 
     # ------------------------------------------------------------ モジュール3: 売買シグナル
 
@@ -281,6 +291,22 @@ class StockBot(ext_commands.Bot):
             await db.save_signal_state(code, {"state": state, "sent": sent})
             return
 
+        await self._send_signal(channel, code, name, ind, df, events)
+        for e in events:
+            sent[e.key] = now.isoformat()
+        label = " / ".join(e.label for e in events)
+        await db.save_signal_state(code, {"state": state, "sent": sent}, last_signal=label)
+
+    async def send_test_signal(self, code: str, name: str) -> bool:
+        """シグナルの有無に関係なく、現在の状態をチャート付きで送る（/test signal 用）。監視状態は変更しない。"""
+        df = (await market.fetch_daily([code])).get(code)
+        if df is None or len(df) < 80:
+            return False
+        channel = await self._channel("DISCORD_CHANNEL_SIGNAL")
+        await self._send_signal(channel, code, name, signals.compute(df), df, [])
+        return True
+
+    async def _send_signal(self, channel, code: str, name: str, ind, df, events: list[signals.Signal]) -> None:
         # チャートは 1 枚ずつ生成してメモリの山を低く保つ
         detail = await asyncio.to_thread(charts.detailed_chart, code, name, ind)
         intraday = await market.fetch_intraday(code)
@@ -288,18 +314,15 @@ class StockBot(ext_commands.Bot):
         files = [discord.File(detail, filename=f"{code}_technical.png")]
         if multi is not None:
             files.append(discord.File(multi, filename=f"{code}_multi.png"))
-
         await channel.send(embed=self._signal_embed(code, name, ind, events), files=files, view=views.signal_view(code))
-        for e in events:
-            sent[e.key] = now.isoformat()
-        label = " / ".join(e.label for e in events)
-        await db.save_signal_state(code, {"state": state, "sent": sent}, last_signal=label)
 
     @staticmethod
     def _signal_embed(code: str, name: str, ind, events: list[signals.Signal]) -> discord.Embed:
         last, prev = ind.iloc[-1], ind.iloc[-2]
         sides = {e.side for e in events}
-        if sides == {"BUY"}:
+        if not events:
+            title, color = "🧪 テスト通知（現在の状態）", discord.Color.light_grey()
+        elif sides == {"BUY"}:
             title, color = "🟢 買いシグナル", discord.Color.green()
         elif sides == {"SELL"}:
             title, color = "🔴 売りシグナル", discord.Color.red()
@@ -307,7 +330,10 @@ class StockBot(ext_commands.Bot):
             title, color = "🟡 売買シグナル（買い・売り混在）", discord.Color.orange()
         change = (last["Close"] / prev["Close"] - 1) * 100
         embed = discord.Embed(title=f"{title}: {name} ({code})", color=color)
-        embed.description = "\n".join(f"・{'買い' if e.side == 'BUY' else '売り'}: {e.label}" for e in events)
+        if events:
+            embed.description = "\n".join(f"・{'買い' if e.side == 'BUY' else '売り'}: {e.label}" for e in events)
+        else:
+            embed.description = "シグナルの有無に関係なく送ったテストです。監視状態は変更していません。"
         embed.add_field(name="終値", value=f"{last['Close']:,.1f} 円 ({change:+.2f}%)")
         embed.add_field(name="RSI(14)", value=f"{last['RSI']:.1f}")
         embed.add_field(name="MACD / シグナル", value=f"{last['MACD']:.2f} / {last['MACD_signal']:.2f}")

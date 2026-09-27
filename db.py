@@ -26,6 +26,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "report_morning": "on",
     "report_close": "on",
     "report_weekly": "on",
+    "report_cleanup": "on",  # 週末の整理タイム
+    "watch_limit": "10",  # 監視できる銘柄数の上限
     # 仮想売買
     "vp_cash": "2400000",  # 自分の現金残高（円）。元手は新NISA 成長投資枠の年間上限と同じ 240 万円
     "vp_cash_ai": "2400000",  # AI の現金残高（円）
@@ -59,6 +61,24 @@ CREATE TABLE IF NOT EXISTS monitored_stocks (
     last_notified_at TIMESTAMPTZ,
     last_signal      TEXT,
     signal_state     JSONB
+);
+-- 監視銘柄の管理強化（メモ・お気に入り・タグ・整理タイムで「続ける」を選んだ日時）
+ALTER TABLE monitored_stocks ADD COLUMN IF NOT EXISTS memo TEXT;
+ALTER TABLE monitored_stocks ADD COLUMN IF NOT EXISTS starred BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE monitored_stocks ADD COLUMN IF NOT EXISTS star_user_id BIGINT;
+ALTER TABLE monitored_stocks ADD COLUMN IF NOT EXISTS tag TEXT;
+ALTER TABLE monitored_stocks ADD COLUMN IF NOT EXISTS kept_at TIMESTAMPTZ;
+ALTER TABLE pending_stocks ADD COLUMN IF NOT EXISTS skip_reason TEXT;
+CREATE TABLE IF NOT EXISTS price_alerts (
+    id           BIGSERIAL PRIMARY KEY,
+    ticker       TEXT NOT NULL,
+    company_name TEXT NOT NULL,
+    target       DOUBLE PRECISION NOT NULL,
+    direction    TEXT NOT NULL,  -- 'above'（超えたら）/ 'below'（割ったら）
+    created_by   BIGINT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    triggered_at TIMESTAMPTZ,
+    active       BOOLEAN NOT NULL DEFAULT true
 );
 CREATE TABLE IF NOT EXISTS user_settings (
     key   TEXT PRIMARY KEY,
@@ -171,6 +191,7 @@ ALTER TABLE vp_positions     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE vp_trades        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE vp_orders        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE vp_snapshots     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE price_alerts     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notification_log ENABLE ROW LEVEL SECURITY;
 """
 
@@ -286,6 +307,11 @@ async def get_pending(pending_id: int) -> dict[str, Any] | None:
         return await (await conn.execute("SELECT * FROM pending_stocks WHERE id = %s", (pending_id,))).fetchone()
 
 
+async def set_skip_reason(pending_id: int, reason: str) -> None:
+    async with _pool_or_raise().connection() as conn:
+        await conn.execute("UPDATE pending_stocks SET skip_reason = %s WHERE id = %s", (reason, pending_id))
+
+
 async def set_pending_status(pending_id: int, status: str) -> None:
     async with _pool_or_raise().connection() as conn:
         await conn.execute("UPDATE pending_stocks SET status = %s WHERE id = %s", (status, pending_id))
@@ -305,6 +331,26 @@ async def add_monitored(ticker: str, company_name: str, source: str) -> bool:
             )
         ).fetchone()
     return row is not None
+
+
+MONITORED_EDITABLE = {"memo", "starred", "star_user_id", "tag", "kept_at"}
+
+
+async def update_monitored(ticker: str, **fields: Any) -> bool:
+    """監視銘柄のメモ・お気に入り・タグなどを更新する。監視していなければ False。"""
+    if not fields or not set(fields) <= MONITORED_EDITABLE:
+        raise ValueError(f"更新できない項目です: {set(fields) - MONITORED_EDITABLE}")
+    assignments = ", ".join(f"{k} = %({k})s" for k in fields)  # 項目名は上の許可リストのものだけ
+    async with _pool_or_raise().connection() as conn:
+        cur = await conn.execute(
+            f"UPDATE monitored_stocks SET {assignments} WHERE ticker = %(ticker)s", {**fields, "ticker": ticker}
+        )
+        return cur.rowcount > 0
+
+
+async def count_monitored() -> int:
+    async with _pool_or_raise().connection() as conn:
+        return (await (await conn.execute("SELECT count(*) AS n FROM monitored_stocks")).fetchone())["n"]
 
 
 async def remove_monitored(ticker: str) -> dict[str, Any] | None:
@@ -629,3 +675,36 @@ async def notifications_since(since: datetime, kind: str | None = None) -> list[
                 (since, kind),
             )
         return await (await conn.execute(sql, params)).fetchall()
+
+
+# ---------------------------------------------------------------- price_alerts
+
+
+async def add_alert(ticker: str, company_name: str, target: float, direction: str, created_by: int | None) -> int:
+    async with _pool_or_raise().connection() as conn:
+        row = await (
+            await conn.execute(
+                "INSERT INTO price_alerts (ticker, company_name, target, direction, created_by) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (ticker, company_name, target, direction, created_by),
+            )
+        ).fetchone()
+    return row["id"]
+
+
+async def list_alerts(active: bool = True) -> list[dict[str, Any]]:
+    async with _pool_or_raise().connection() as conn:
+        return await (
+            await conn.execute("SELECT * FROM price_alerts WHERE active = %s ORDER BY created_at", (active,))
+        ).fetchall()
+
+
+async def close_alert(alert_id: int, triggered: bool) -> bool:
+    """アラートを終了する（triggered=True なら達して通知した、False なら取り消し）。"""
+    async with _pool_or_raise().connection() as conn:
+        cur = await conn.execute(
+            "UPDATE price_alerts SET active = false, triggered_at = CASE WHEN %s THEN now() END "
+            "WHERE id = %s AND active",
+            (triggered, alert_id),
+        )
+        return cur.rowcount > 0

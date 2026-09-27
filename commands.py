@@ -1,4 +1,4 @@
-"""スラッシュコマンド: /settings, /watch add|remove|list, /buy, /sell, /portfolio, /orders, /battle, /deposit, /chart, /ranking, /compare, /related, /review, /test proposal|signal|report"""
+"""スラッシュコマンド: /settings, /watch add|remove|list|memo|star|tag, /alert add|list|remove, /buy, /sell, /portfolio, /orders, /battle, /deposit, /chart, /ranking, /compare, /related, /review, /test proposal|signal|report"""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import reports
 import signals
 import review
 import views
+import watchlist
 from ticker_master import CODE_PATTERN, normalize_code
 
 TEST_SIGNAL_TIMEOUT = 300  # 秒
@@ -69,9 +70,14 @@ class WatchGroup(
             detail = "JPX の銘柄一覧に未掲載のため、株価データで上場を確認しました（新規上場銘柄など）"
 
         send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
-        if not await db.add_monitored(code, name, "manual"):
+        if code in {s["ticker"] for s in await db.list_monitored()}:
             await send(f"ℹ️ {name} ({code}) はすでに監視中です。")
             return
+        if await views.watch_is_full():
+            view = await views.ReplaceWatchView.create(code, name, "manual")
+            await send(await views.replace_prompt(code, name), view=view, ephemeral=True)
+            return
+        await db.add_monitored(code, name, "manual")
         embed = discord.Embed(
             title=f"👀 {name} ({code}) を監視対象に追加しました",
             description=f"{detail}\n次回のシグナル判定から監視を始めます。",
@@ -91,11 +97,109 @@ class WatchGroup(
         await interaction.response.send_message(f"🗑️ {removed['company_name']} ({code}) を監視対象から外しました。")
 
     @app_commands.command(name="list", description="監視中の銘柄を一覧表示します")
-    async def list_(self, interaction: discord.Interaction) -> None:
-        stocks = await db.list_monitored()
+    @app_commands.describe(tag="タグで絞り込む")
+    @app_commands.choices(tag=[app_commands.Choice(name=v, value=k) for k, v in watchlist.TAG_LABELS.items()])
+    async def list_(self, interaction: discord.Interaction, tag: app_commands.Choice[str] | None = None) -> None:
+        stocks = views.sort_watch(await db.list_monitored())
+        if tag:
+            stocks = [s for s in stocks if s["tag"] == tag.value]
         await interaction.response.send_message(
-            embed=views.watch_list_embed(stocks), view=views.WatchListView(stocks), ephemeral=True
+            embed=views.watch_list_embed(stocks, await views.watch_limit()),
+            view=views.WatchListView(stocks),
+            ephemeral=True,
         )
+
+    @app_commands.command(name="memo", description="監視銘柄に「なぜ監視したか」のメモを残します（空にすると削除）")
+    @app_commands.describe(code="証券コード", memo="メモ（200 字まで）")
+    @app_commands.autocomplete(code=_monitored_autocomplete)
+    async def memo(
+        self, interaction: discord.Interaction, code: str, memo: app_commands.Range[str, 0, 200] = ""
+    ) -> None:
+        code = normalize_code(code)
+        if not await db.update_monitored(code, memo=memo.strip() or None):
+            await interaction.response.send_message(f"ℹ️ `{code}` は監視対象ではありません。", ephemeral=True)
+            return
+        text = f"📝 {code} のメモを保存しました: {memo.strip()}" if memo.strip() else f"📝 {code} のメモを削除しました。"
+        await interaction.response.send_message(text, ephemeral=True)
+
+    @app_commands.command(name="star", description="お気に入り（⭐）を付け外しします。⭐ の銘柄のシグナルではメンションします")
+    @app_commands.describe(code="証券コード")
+    @app_commands.autocomplete(code=_monitored_autocomplete)
+    async def star(self, interaction: discord.Interaction, code: str) -> None:
+        code = normalize_code(code)
+        stock = next((s for s in await db.list_monitored() if s["ticker"] == code), None)
+        if stock is None:
+            await interaction.response.send_message(f"ℹ️ `{code}` は監視対象ではありません。", ephemeral=True)
+            return
+        starred = not stock["starred"]
+        await db.update_monitored(code, starred=starred, star_user_id=interaction.user.id if starred else None)
+        text = (
+            f"⭐ {stock['company_name']} ({code}) をお気に入りにしました。シグナルが出たらメンションでお知らせします。"
+            if starred
+            else f"☆ {stock['company_name']} ({code}) のお気に入りを外しました。"
+        )
+        await interaction.response.send_message(text, ephemeral=True)
+
+    @app_commands.command(name="tag", description="監視銘柄にタグ（長期・短期・様子見）を付けます")
+    @app_commands.describe(code="証券コード", tag="タグ")
+    @app_commands.choices(
+        tag=[app_commands.Choice(name=v, value=k) for k, v in watchlist.TAG_LABELS.items()]
+        + [app_commands.Choice(name="なし", value="none")]
+    )
+    @app_commands.autocomplete(code=_monitored_autocomplete)
+    async def tag(self, interaction: discord.Interaction, code: str, tag: app_commands.Choice[str]) -> None:
+        code = normalize_code(code)
+        if not await db.update_monitored(code, tag=None if tag.value == "none" else tag.value):
+            await interaction.response.send_message(f"ℹ️ `{code}` は監視対象ではありません。", ephemeral=True)
+            return
+        await interaction.response.send_message(f"🏷️ {code} のタグを「{tag.name}」にしました。", ephemeral=True)
+
+
+async def _alert_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
+    return [
+        app_commands.Choice(
+            name=f"#{a['id']} {a['company_name']} {a['target']:,.0f}円{'超え' if a['direction'] == 'above' else '割れ'}"[:100],
+            value=a["id"],
+        )
+        for a in await db.list_alerts()
+        if current in str(a["id"]) or current in a["company_name"] or current in a["ticker"]
+    ][:25]
+
+
+class AlertGroup(
+    app_commands.Group,
+    name="alert",
+    description="価格アラート（指定した価格を超えた・割ったら通知）",
+    default_permissions=discord.Permissions(manage_guild=True),
+):
+    @app_commands.command(name="add", description="指定した価格を超えた（今より上なら）・割った（今より下なら）ときに通知します")
+    @app_commands.describe(code="証券コード", price="価格（円）")
+    async def add(self, interaction: discord.Interaction, code: str, price: app_commands.Range[float, 0.1]) -> None:
+        async def body():
+            c, name = await _resolve(interaction, code)
+            df = await _daily(c, name, min_bars=1)
+            now = float(df["Close"].iloc[-1])
+            if price == now:
+                raise CommandError(f"今の株価（{now:,.1f} 円）と同じ価格は指定できません。")
+            direction = "above" if price > now else "below"
+            alert_id = await db.add_alert(c, name, price, direction, interaction.user.id)
+            word = "超えたら" if direction == "above" else "割ったら"
+            text = f"⏰ #{alert_id} {name} ({c}) が {price:,.1f} 円を{word}お知らせします（今 {now:,.1f} 円）。"
+            return {"content": text}
+
+        await _run(interaction, True, body)
+
+    @app_commands.command(name="list", description="設定中の価格アラートを表示します")
+    async def list_(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(embed=views.alerts_embed(await db.list_alerts()), ephemeral=True)
+
+    @app_commands.command(name="remove", description="価格アラートを取り消します")
+    @app_commands.describe(alert_id="アラート")
+    @app_commands.autocomplete(alert_id=_alert_autocomplete)
+    async def remove(self, interaction: discord.Interaction, alert_id: int) -> None:
+        ok = await db.close_alert(alert_id, triggered=False)
+        text = f"🗑️ アラート #{alert_id} を取り消しました。" if ok else f"アラート #{alert_id} は見つからないか、終了済みです。"
+        await interaction.response.send_message(text, ephemeral=True)
 
 
 class TestGroup(
@@ -446,6 +550,7 @@ async def related_command(interaction: discord.Interaction, code: str, private: 
 def setup(tree: app_commands.CommandTree) -> None:
     tree.add_command(settings_command)
     tree.add_command(WatchGroup())
+    tree.add_command(AlertGroup())
     tree.add_command(TestGroup())
     tree.add_command(buy_command)
     tree.add_command(sell_command)

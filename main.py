@@ -31,6 +31,7 @@ import portfolio
 import reports
 import signals
 import views
+import watchlist
 from jev_client import JevJudge
 from market import JST
 from relations import RelationGraph
@@ -61,6 +62,8 @@ PRICE_SYNC_PROPOSAL_DAYS = 35
 FILL_TIMES = [time(9, 30), time(10, 0), time(11, 0), time(13, 0)]
 DEFAULT_DEPOSIT = 2_400_000
 DEPOSIT_PROMPT = (12, 20, time(10, 0))  # 12 月 20 日 10:00 に、来年の入金額を確認するお知らせを送る
+# 週末の整理タイム（土曜 10:00）
+CLEANUP_TIME = time(10, 0)
 REPORT_TIMES = {"morning": time(8, 45), "close": time(16, 5), "weekly": time(16, 10)}
 
 
@@ -97,6 +100,15 @@ def fill_slots(day: datetime) -> list[datetime]:
     return [datetime.combine(day.date(), t, JST) for t in FILL_TIMES]
 
 
+def alert_slots(day: datetime) -> list[datetime]:
+    """価格アラートを調べる時刻（取引日の場中、15 分おき）。"""
+    return signal_slots("15m", day)
+
+
+def cleanup_slots(day: datetime) -> list[datetime]:
+    return [datetime.combine(day.date(), CLEANUP_TIME, JST)] if day.weekday() == 5 else []
+
+
 def report_slots(kind: str, day: datetime) -> list[datetime]:
     d = day.date()
     if kind == "weekly":
@@ -127,6 +139,7 @@ class StockBot(ext_commands.Bot):
         self._report_lock = asyncio.Lock()
         self._fill_lock = asyncio.Lock()
         self._deposit_lock = asyncio.Lock()
+        self._alert_lock = asyncio.Lock()
         self._background: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------ 起動・終了
@@ -144,6 +157,7 @@ class StockBot(ext_commands.Bot):
             views.UnwatchButton,
             views.VirtualBuyButton,
             views.DepositButton,
+            views.PruneButton,
         )
         commands.setup(self.tree)
         if guild_id := os.getenv("DISCORD_GUILD_ID"):
@@ -223,6 +237,16 @@ class StockBot(ext_commands.Bot):
         if now.year > int(settings.get("_last_deposit_year") or now.year) and not self._deposit_lock.locked():
             await db.set_setting("_last_deposit_year", str(now.year))
             self._spawn(self._guarded(self._deposit_lock, self.run_deposit, settings))
+
+        slot = due_slot(alert_slots(now), now)
+        if slot and slot != settings.get("_last_alert_slot") and not self._alert_lock.locked():
+            await db.set_setting("_last_alert_slot", slot)
+            self._spawn(self._guarded(self._alert_lock, self.run_alert_job))
+
+        slot = due_slot(cleanup_slots(now), now)
+        if settings.get("report_cleanup", "on") == "on" and slot and slot != settings.get("_last_cleanup_slot"):
+            await db.set_setting("_last_cleanup_slot", slot)
+            self._spawn(self._guarded(self._report_lock, self.run_cleanup))
 
         for kind in reports.BUILDERS:
             if settings.get(f"report_{kind}", "on") != "on":
@@ -439,6 +463,39 @@ class StockBot(ext_commands.Bot):
             s = await portfolio.summary(owner)
             await db.vp_save_snapshot(owner, today, s.total_value, s.deposits)
 
+    # ------------------------------------------------------------ 価格アラート・週末の整理タイム
+
+    async def run_alert_job(self) -> None:
+        alerts = await db.list_alerts()
+        if not alerts:
+            return
+        daily = await market.get_daily(sorted({a["ticker"] for a in alerts}))
+        hits = watchlist.check_alerts(alerts, daily)
+        if not hits:
+            return
+        channel = await self._channel("DISCORD_CHANNEL_SIGNAL")
+        for hit in hits:
+            a = hit.alert
+            if not await db.close_alert(a["id"], triggered=True):
+                continue  # 同時に取り消されていた
+            word = "超えました" if a["direction"] == "above" else "割りました"
+            embed = discord.Embed(
+                title=f"⏰ {a['company_name']} ({a['ticker']}) が {a['target']:,.1f} 円を{word}",
+                description=f"今日の{'高値' if a['direction'] == 'above' else '安値'} {hit.price:,.1f} 円（約 20 分遅れ）",
+                color=discord.Color.orange(),
+            )
+            mention = f"<@{a['created_by']}>" if a["created_by"] else None
+            await channel.send(content=mention, embed=embed, view=views.decided_view(a["ticker"]))
+            await db.log_notification("alert", a["ticker"], f"{a['target']:.1f}")
+
+    async def run_cleanup(self) -> None:
+        candidates = await watchlist.cleanup_candidates(market.now_jst())
+        if not candidates:
+            return
+        embed, view = views.cleanup_message(candidates, await db.count_monitored(), await views.watch_limit())
+        await (await self._report_channel()).send(embed=embed, view=view)
+        await db.log_notification("cleanup", detail=",".join(c.ticker for c in candidates))
+
     # ------------------------------------------------------------ 追加入金
 
     async def send_deposit_prompt(self) -> None:
@@ -516,7 +573,7 @@ class StockBot(ext_commands.Bot):
             await db.save_signal_state(code, {"state": state, "sent": sent})
             return
 
-        await self._send_signal(channel, code, name, ind, df, events)
+        await self._send_signal(channel, code, name, ind, df, events, stock)
         for e in events:
             sent[e.key] = now.isoformat()
         label = " / ".join(e.label for e in events)
@@ -532,7 +589,9 @@ class StockBot(ext_commands.Bot):
         await self._send_signal(channel, code, name, signals.compute(df), df, [])
         return True
 
-    async def _send_signal(self, channel, code: str, name: str, ind, df, events: list[signals.Signal]) -> None:
+    async def _send_signal(
+        self, channel, code: str, name: str, ind, df, events: list[signals.Signal], stock: dict | None = None
+    ) -> None:
         # チャートは 1 枚ずつ生成してメモリの山を低く保つ
         detail = await asyncio.to_thread(charts.detailed_chart, code, name, ind)
         intraday = await market.fetch_intraday(code)
@@ -540,7 +599,16 @@ class StockBot(ext_commands.Bot):
         files = [discord.File(detail, filename=f"{code}_technical.png")]
         if multi is not None:
             files.append(discord.File(multi, filename=f"{code}_multi.png"))
-        await channel.send(embed=self._signal_embed(code, name, ind, events), files=files, view=views.signal_view(code))
+        embed = self._signal_embed(code, name, ind, events)
+        content = None
+        if stock and stock.get("memo"):
+            embed.add_field(name="📝 メモ", value=stock["memo"], inline=False)
+        if stock and stock.get("starred"):
+            # お気に入りの銘柄は目立たせ、⭐ を付けた人にメンションする
+            embed.title = f"⭐ {embed.title}"
+            embed.color = discord.Color.gold()
+            content = f"<@{stock['star_user_id']}>" if stock.get("star_user_id") else None
+        await channel.send(content=content, embed=embed, files=files, view=views.signal_view(code))
 
     @staticmethod
     def _signal_embed(code: str, name: str, ind, events: list[signals.Signal]) -> discord.Embed:

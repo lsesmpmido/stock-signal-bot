@@ -7,6 +7,7 @@ Bot の再起動後も過去のメッセージのボタンが押せるように�
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -20,6 +21,7 @@ import market
 import orders
 import portfolio
 import review
+import watchlist
 from market import JST
 
 log = logging.getLogger(__name__)
@@ -40,6 +42,7 @@ REPORT_OPTIONS = [
     ("morning", "🌅 朝のブリーフィング (8:45)"),
     ("close", "🔔 大引けレポート (16:05)"),
     ("weekly", "📅 週間レポート (週の最後の取引日 16:10)"),
+    ("cleanup", "🧹 週末の整理タイム (土曜 10:00)"),
 ]
 
 
@@ -72,6 +75,13 @@ def link_view(code: str) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     for label, url in external_links(code):
         view.add_item(discord.ui.Button(label=label, url=url, row=0))
+    return view
+
+
+def decided_view(code: str) -> discord.ui.View:
+    """提案を承認・スキップした後のボタン（リンクと「仮想で買う」は残す）。"""
+    view = link_view(code)
+    view.add_item(VirtualBuyButton(code))
     return view
 
 
@@ -120,12 +130,18 @@ class AddPendingButton(discord.ui.DynamicItem[discord.ui.Button], template=r"pen
             await interaction.response.send_message("この提案は見つかりませんでした。", ephemeral=True)
             return
         code, name = pending["ticker"], pending["company_name"]
+        if await watch_is_full() and code not in {s["ticker"] for s in await db.list_monitored()}:
+            view = await ReplaceWatchView.create(code, name, "proposal", self.pending_id, interaction.message)
+            await interaction.response.send_message(
+                content=await replace_prompt(code, name), view=view, ephemeral=True
+            )
+            return
         added = await db.add_monitored(code, name, "proposal")
         await db.set_pending_status(self.pending_id, "added")
         note = f"✅ {interaction.user.display_name} が監視対象に追加しました"
         if not added:
             note = "ℹ️ すでに監視対象に登録されています"
-        await interaction.response.edit_message(embed=_with_footer(interaction.message, note), view=link_view(code))
+        await interaction.response.edit_message(embed=_with_footer(interaction.message, note), view=decided_view(code))
 
 
 class SkipPendingButton(discord.ui.DynamicItem[discord.ui.Button], template=r"pending:skip:(?P<id>[0-9]+)"):
@@ -148,8 +164,13 @@ class SkipPendingButton(discord.ui.DynamicItem[discord.ui.Button], template=r"pe
         pending = await db.get_pending(self.pending_id)
         await db.set_pending_status(self.pending_id, "skipped")
         embed = _with_footer(interaction.message, "⏭️ スキップしました")
-        view = link_view(pending["ticker"]) if pending else None
+        view = decided_view(pending["ticker"]) if pending else None
         await interaction.response.edit_message(embed=embed, view=view)
+        await interaction.followup.send(
+            "よければスキップした理由を選んでください（選ばなくてもスキップは完了しています）。",
+            view=SkipReasonView(self.pending_id),
+            ephemeral=True,
+        )
 
 
 class UnwatchButton(discord.ui.DynamicItem[discord.ui.Button], template=r"watch:remove:(?P<code>[0-9A-Z]+)"):
@@ -553,6 +574,157 @@ def review_embed(r: review.Review) -> discord.Embed:
     return embed
 
 
+# ---------------------------------------------------------------- 監視枠・スキップの理由・整理タイム・アラート
+
+
+async def watch_limit() -> int:
+    return int((await db.get_all_settings())["watch_limit"])
+
+
+async def watch_is_full() -> bool:
+    return await db.count_monitored() >= await watch_limit()
+
+
+async def replace_prompt(code: str, name: str) -> str:
+    return (
+        f"監視枠（{await watch_limit()} 銘柄）がいっぱいです。{name} ({code}) を追加するなら、"
+        "入れ替える銘柄を選んでください。"
+    )
+
+
+class _ReplaceSelect(discord.ui.Select):
+    def __init__(self, stocks: list[dict]) -> None:
+        super().__init__(
+            placeholder="外して入れ替える銘柄を選択",
+            options=[
+                discord.SelectOption(label=f"{s['ticker']} {s['company_name']}"[:100], value=s["ticker"])
+                for s in sort_watch(stocks)[:25]
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view: ReplaceWatchView = self.view
+        removed = await db.remove_monitored(self.values[0])
+        await db.add_monitored(view.code, view.name, view.source)
+        if view.pending_id is not None:
+            await db.set_pending_status(view.pending_id, "added")
+        if view.proposal_message is not None:
+            note = f"✅ {interaction.user.display_name} が監視対象に追加しました（{removed['company_name']} と入れ替え）"
+            await view.proposal_message.edit(
+                embed=_with_footer(view.proposal_message, note), view=decided_view(view.code)
+            )
+        await interaction.response.edit_message(
+            content=f"🔁 {removed['company_name']} ({removed['ticker']}) を外して、{view.name} ({view.code}) を追加しました。",
+            view=None,
+        )
+
+
+class ReplaceWatchView(discord.ui.View):
+    """監視枠が満杯のときに、入れ替える銘柄を選ぶ（入れ替えないことも選べる）。"""
+
+    def __init__(self, code: str, name: str, source: str, pending_id: int | None = None, proposal_message=None) -> None:
+        super().__init__(timeout=600)
+        self.code, self.name, self.source = code, name, source
+        self.pending_id, self.proposal_message = pending_id, proposal_message
+
+    @classmethod
+    async def create(cls, *args, **kwargs) -> ReplaceWatchView:
+        view = cls(*args, **kwargs)
+        view.add_item(_ReplaceSelect(await db.list_monitored()))
+        return view
+
+    @discord.ui.button(label="入れ替えない", style=discord.ButtonStyle.secondary, row=1)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content=f"{self.name} ({self.code}) の追加をやめました。", view=None)
+
+
+SKIP_REASONS = [
+    ("expensive", "💸 高すぎる"),
+    ("sector", "🙅 業種が苦手"),
+    ("weak", "📰 材料が弱い"),
+    ("too_late", "🚀 もう上がりすぎ"),
+    ("other", "🤷 その他"),
+]
+
+
+class _SkipReasonSelect(discord.ui.Select):
+    def __init__(self, pending_id: int) -> None:
+        super().__init__(
+            placeholder="スキップした理由",
+            options=[discord.SelectOption(label=label, value=key) for key, label in SKIP_REASONS],
+        )
+        self.pending_id = pending_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await db.set_skip_reason(self.pending_id, self.values[0])
+        label = dict(SKIP_REASONS)[self.values[0]]
+        await interaction.response.edit_message(content=f"📝 スキップの理由（{label}）を記録しました。", view=None)
+
+
+class SkipReasonView(discord.ui.View):
+    def __init__(self, pending_id: int) -> None:
+        super().__init__(timeout=600)
+        self.add_item(_SkipReasonSelect(pending_id))
+
+
+class PruneButton(discord.ui.DynamicItem[discord.ui.Button], template=r"prune:(?P<action>keep|remove):(?P<code>[0-9A-Z]+)"):
+    """週末の整理タイムの「続ける」「外す」ボタン。"""
+
+    def __init__(self, action: str, code: str, name: str = "") -> None:
+        label = f"{'続ける' if action == 'keep' else '外す'}: {name or code}"[:80]
+        style = discord.ButtonStyle.secondary if action == "keep" else discord.ButtonStyle.danger
+        super().__init__(discord.ui.Button(label=label, style=style, custom_id=f"prune:{action}:{code}"))
+        self.action, self.code = action, code
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match) -> Any:
+        return cls(match["action"], match["code"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if self.action == "keep":
+            ok = await db.update_monitored(self.code, kept_at=datetime.now(timezone.utc))
+            text = f"👍 {self.code} は監視を続けます（{watchlist.KEEP_DAYS} 日間は候補に出しません）。"
+        else:
+            ok = (await db.remove_monitored(self.code)) is not None
+            text = f"🧹 {self.code} を監視対象から外しました。"
+        if not ok:
+            text = f"{self.code} はすでに監視対象ではありません。"
+        await interaction.response.send_message(text, ephemeral=True)
+
+
+def cleanup_message(candidates: list[watchlist.CleanupCandidate], total: int, limit: int):
+    embed = discord.Embed(
+        title="🧹 週末の整理タイム",
+        description=(
+            f"監視中 {total} / {limit} 銘柄。外すか続けるか、ボタンで選んでください。\n"
+            "監視を絞ると、通知が見やすくなります。"
+        ),
+        color=discord.Color.dark_green(),
+    )
+    view = discord.ui.View(timeout=None)
+    for i, c in enumerate(candidates):
+        embed.add_field(name=f"{c.label}: {c.name} ({c.ticker})", value=c.detail, inline=False)
+        keep, remove = PruneButton("keep", c.ticker, c.name), PruneButton("remove", c.ticker, c.name)
+        keep.item.row = remove.item.row = i
+        view.add_item(keep)
+        view.add_item(remove)
+    return embed, view
+
+
+def alerts_embed(alerts: list[dict]) -> discord.Embed:
+    embed = discord.Embed(title=f"⏰ 価格アラート ({len(alerts)})", color=discord.Color.orange())
+    if not alerts:
+        embed.description = "設定中のアラートはありません。`/alert add` で設定できます。"
+        return embed
+    embed.description = "\n".join(
+        f"#{a['id']} {a['company_name']} ({a['ticker']}) が {a['target']:,.1f} 円を"
+        f"{'超えたら' if a['direction'] == 'above' else '割ったら'}"
+        for a in alerts
+    )
+    embed.set_footer(text="取引時間中に 15 分おきにチェック ・ 株価は約 20 分遅れ")
+    return embed
+
+
 # ---------------------------------------------------------------- /settings
 
 
@@ -645,17 +817,25 @@ class WatchListView(discord.ui.View):
             self.add_item(_UnwatchSelect(stocks))
 
 
-def watch_list_embed(stocks: list[dict]) -> discord.Embed:
-    embed = discord.Embed(title=f"👀 監視中の銘柄 ({len(stocks)})", color=discord.Color.blurple())
+def sort_watch(stocks: list[dict]) -> list[dict]:
+    """お気に入り（⭐）を先頭に、あとは追加した順。"""
+    return sorted(stocks, key=lambda s: (not s.get("starred"), s["added_at"]))
+
+
+def watch_list_embed(stocks: list[dict], limit: int | None = None) -> discord.Embed:
+    count = f"{len(stocks)} / {limit}" if limit else str(len(stocks))
+    embed = discord.Embed(title=f"👀 監視中の銘柄 ({count})", color=discord.Color.blurple())
     if not stocks:
         embed.description = "監視中の銘柄はありません。`/watch add` で追加できます。"
         return embed
     for s in stocks[:25]:
         added = s["added_at"].astimezone(JST).strftime("%Y/%m/%d")
+        tag = f"［{watchlist.TAG_LABELS[s['tag']]}］" if s.get("tag") in watchlist.TAG_LABELS else ""
+        value = f"{SOURCE_LABELS.get(s['source'], s['source'])}・{added}追加\n最後のシグナル: {s['last_signal'] or 'なし'}"
+        if s.get("memo"):
+            value += f"\n📝 {s['memo']}"
         embed.add_field(
-            name=f"{s['ticker']} {s['company_name']}",
-            value=f"{SOURCE_LABELS.get(s['source'], s['source'])}・{added}追加\n最後のシグナル: {s['last_signal'] or 'なし'}",
-            inline=True,
+            name=f"{'⭐ ' if s.get('starred') else ''}{s['ticker']} {s['company_name']}{tag}", value=value[:1024], inline=True
         )
     if len(stocks) > 25:
         embed.set_footer(text=f"ほか {len(stocks) - 25} 件（表示は25件まで）")

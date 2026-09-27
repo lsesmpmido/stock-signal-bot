@@ -14,6 +14,7 @@ import discord
 import db
 import market
 import portfolio
+import review
 from market import JST
 
 log = logging.getLogger(__name__)
@@ -266,6 +267,52 @@ def portfolio_embed(s: portfolio.Summary) -> discord.Embed:
     embed.set_footer(
         text=f"今年の税金 {_yen(s.year_tax)} ・ 手数料 {_yen(s.year_fee)} ・ {s.started_at.astimezone(JST):%Y/%m/%d} 開始 ・ 株価は約 20 分遅れ"
     )
+    return embed
+
+
+# ---------------------------------------------------------------- 答え合わせ
+
+
+def review_embed(r: review.Review) -> discord.Embed:
+    label = "1週間" if r.days == 5 else "1か月" if r.days == 20 else f"{r.days}営業日"
+    embed = discord.Embed(title=f"📝 提案の答え合わせ（{r.days}営業日後 ≒ {label}）", color=discord.Color.purple())
+    lines = [f"対象: {r.since:%m/%d} 以降の提案 {len(r.outcomes)} 件（評価待ち {r.waiting} 件）"]
+    if not r.outcomes:
+        embed.description = "\n".join(lines + ["", "評価できる提案はまだありません。提案から数営業日たつと表示されます。"])
+        return embed
+
+    def row(name: str, g: review.Group | None) -> str | None:
+        if g is None:
+            return None
+        excess = f" / TOPIX比 {g.excess:+.1%}" if g.excess is not None else ""
+        return f"{name}: {g.count} 件　平均 {g.change:+.1%}{excess}"
+
+    for status, name in review.STATUS_LABELS.items():
+        if text := row(name, r.group(lambda o, s=status: o.status == s and o.kind == "news")):
+            lines.append(text)
+    added = r.group(lambda o: o.status == "added" and o.kind == "news")
+    skipped = r.group(lambda o: o.status == "skipped" and o.kind == "news")
+    if added and skipped:
+        diff = added.change - skipped.change
+        lines.append(f"→ 承認した銘柄は、スキップした銘柄より {abs(diff):.1%} {'良かった' if diff >= 0 else '悪かった'}")
+    if text := row("🔗 関連銘柄", r.group(lambda o: o.kind == "related")):
+        lines.append(text)
+    high = r.group(lambda o: o.impact >= review.HIGH_IMPACT)
+    low = r.group(lambda o: o.impact < review.HIGH_IMPACT)
+    if high and low:
+        lines.append(f"🎯 Jev 高評価（インパクト {review.HIGH_IMPACT} 以上）平均 {high.change:+.1%} / それ以外 {low.change:+.1%}")
+    embed.description = "\n".join(lines)
+
+    picks = []
+    if (o := r.extreme("added", highest=True)) and o.change > 0:
+        picks.append(f"👍 ナイス承認: {o.company_name} ({o.ticker}) {o.change:+.1%}")
+    if (o := r.extreme("skipped", highest=False)) and o.change < 0:
+        picks.append(f"✨ ナイススキップ: {o.company_name} ({o.ticker}) {o.change:+.1%}")
+    if (o := r.extreme("skipped", highest=True)) and o.change > 0:
+        picks.append(f"😢 惜しいスキップ: {o.company_name} ({o.ticker}) {o.change:+.1%}")
+    if picks:
+        embed.add_field(name="注目の提案", value="\n".join(picks), inline=False)
+    embed.set_footer(text="基準は提案時点で確定していた直近の終値。未回答は比較から外して参考表示")
     return embed
 
 

@@ -1,4 +1,4 @@
-"""スラッシュコマンド: /settings, /watch add|remove|list, /buy, /sell, /portfolio, /test proposal|signal"""
+"""スラッシュコマンド: /settings, /watch add|remove|list, /buy, /sell, /portfolio, /review, /test proposal|signal"""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from discord import app_commands
 import db
 import market
 import portfolio
+import review
 import views
 from ticker_master import CODE_PATTERN, normalize_code
 
@@ -226,6 +227,22 @@ async def portfolio_command(interaction: discord.Interaction) -> None:
     await interaction.followup.send(embed=views.portfolio_embed(summary))
 
 
+@app_commands.command(name="review", description="過去の提案が当たっていたかを答え合わせします")
+@app_commands.describe(period="評価する期間（既定: 1週間）")
+@app_commands.choices(
+    period=[app_commands.Choice(name="1週間（5営業日後）", value=5), app_commands.Choice(name="1か月（20営業日後）", value=20)]
+)
+@app_commands.default_permissions(manage_guild=True)
+async def review_command(interaction: discord.Interaction, period: app_commands.Choice[int] | None = None) -> None:
+    await interaction.response.defer(thinking=True)
+    try:
+        result = await review.build(period.value if period else 5)
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ 答え合わせでエラーが発生しました: `{exc}`")
+        raise
+    await interaction.followup.send(embed=views.review_embed(result))
+
+
 def setup(tree: app_commands.CommandTree) -> None:
     tree.add_command(settings_command)
     tree.add_command(WatchGroup())
@@ -233,3 +250,4 @@ def setup(tree: app_commands.CommandTree) -> None:
     tree.add_command(buy_command)
     tree.add_command(sell_command)
     tree.add_command(portfolio_command)
+    tree.add_command(review_command)

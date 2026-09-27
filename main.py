@@ -306,8 +306,9 @@ class StockBot(ext_commands.Bot):
     async def _post_proposals(self, channel, results: list[tuple]) -> int:
         posted = 0
         for item, info, ctx, judgement in results:
+            kind = "news" if ctx is None else "related"
             pending_id = await db.add_pending(
-                info.code, info.name, item.title, item.url, judgement.is_positive, judgement.impact
+                info.code, info.name, item.title, item.url, judgement.is_positive, judgement.impact, kind
             )
             if pending_id is None:
                 continue

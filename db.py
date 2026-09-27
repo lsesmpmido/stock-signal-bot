@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS pending_stocks (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (ticker, news_url)
 );
+-- 既存の DB にも列を追加する（'news' = ニュースの銘柄、'related' = 関連銘柄）
+ALTER TABLE pending_stocks ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'news';
 CREATE TABLE IF NOT EXISTS monitored_stocks (
     ticker           TEXT PRIMARY KEY,
     company_name     TEXT NOT NULL,
@@ -186,18 +188,32 @@ async def recently_proposed_tickers(days: int = 3) -> set[str]:
 
 
 async def add_pending(
-    ticker: str, company_name: str, news_title: str, news_url: str, score: float, impact: float
+    ticker: str,
+    company_name: str,
+    news_title: str,
+    news_url: str,
+    score: float,
+    impact: float,
+    kind: str = "news",
 ) -> int | None:
     """提案を保存して id を返す。同じ銘柄×同じ記事が既にあれば None。"""
     async with _pool_or_raise().connection() as conn:
         row = await (
             await conn.execute(
-                "INSERT INTO pending_stocks (ticker, company_name, news_title, news_url, score, impact) "
-                "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (ticker, news_url) DO NOTHING RETURNING id",
-                (ticker, company_name, news_title, news_url, score, impact),
+                "INSERT INTO pending_stocks (ticker, company_name, news_title, news_url, score, impact, kind) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (ticker, news_url) DO NOTHING RETURNING id",
+                (ticker, company_name, news_title, news_url, score, impact, kind),
             )
         ).fetchone()
     return row["id"] if row else None
+
+
+async def list_pending_since(since: datetime) -> list[dict[str, Any]]:
+    """since 以降の提案を古い順に返す（答え合わせ用）。"""
+    async with _pool_or_raise().connection() as conn:
+        return await (
+            await conn.execute("SELECT * FROM pending_stocks WHERE created_at >= %s ORDER BY created_at", (since,))
+        ).fetchall()
 
 
 async def get_pending(pending_id: int) -> dict[str, Any] | None:

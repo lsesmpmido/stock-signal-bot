@@ -402,10 +402,22 @@ class StockBot(ext_commands.Bot):
         return embed
 
 
+REQUIRED_ENV = (
+    "DISCORD_TOKEN",
+    "DISCORD_CHANNEL_PROPOSAL",
+    "DISCORD_CHANNEL_SIGNAL",
+    "JEV_API_KEY",
+    "DATABASE_URL",
+)
+
+
 async def main() -> None:
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("discord.http").setLevel(logging.WARNING)
+    # 足りない環境変数があると、該当する処理を実行したときに初めて失敗するので、起動時にまとめて確認する
+    if missing := [key for key in REQUIRED_ENV if not os.getenv(key, "").strip()]:
+        raise SystemExit(f"環境変数が設定されていません: {', '.join(missing)}")
     bot = StockBot()
     async with bot:
         await bot.start(os.environ["DISCORD_TOKEN"])

@@ -1,6 +1,8 @@
-"""スラッシュコマンド: /settings, /watch add|remove|list"""
+"""スラッシュコマンド: /settings, /watch add|remove|list, /test proposal|signal"""
 
 from __future__ import annotations
+
+import asyncio
 
 import discord
 from discord import app_commands
@@ -9,6 +11,8 @@ import db
 import market
 import views
 from ticker_master import CODE_PATTERN, normalize_code
+
+TEST_SIGNAL_TIMEOUT = 300  # 秒
 
 
 @app_commands.command(name="settings", description="通知頻度（新銘柄提案・売買シグナル）を変更します")
@@ -122,12 +126,25 @@ class TestGroup(
     async def signal(self, interaction: discord.Interaction, code: str) -> None:
         code = normalize_code(code)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        info = interaction.client.master.get(code)
-        name = info.name if info else await market.lookup_listed_name(code)
-        if name is None:
-            await interaction.followup.send(f"❌ 証券コード `{code}` の上場銘柄は見つかりませんでした。", ephemeral=True)
+        try:
+            info = interaction.client.master.get(code)
+            name = info.name if info else await market.lookup_listed_name(code)
+            if name is None:
+                await interaction.followup.send(f"❌ 証券コード `{code}` の上場銘柄は見つかりませんでした。", ephemeral=True)
+                return
+            ok = await asyncio.wait_for(interaction.client.send_test_signal(code, name), TEST_SIGNAL_TIMEOUT)
+        except asyncio.TimeoutError:
+            await interaction.followup.send(
+                "⚠️ テスト通知がタイムアウトしました。株価データの取得（yfinance）が止まっている可能性があります。"
+                "実行環境のログを確認してください。",
+                ephemeral=True,
+            )
             return
-        if not await interaction.client.send_test_signal(code, name):
+        except Exception as exc:
+            # 例外のまま終わると「考え中…」の表示が残り続けるので、必ず結果を返す
+            await interaction.followup.send(f"⚠️ テスト通知の送信でエラーが発生しました: `{exc}`", ephemeral=True)
+            raise
+        if not ok:
             await interaction.followup.send(f"⚠️ {name} ({code}) の株価データを取得できませんでした。", ephemeral=True)
             return
         await interaction.followup.send(f"✅ {name} ({code}) のテスト通知を送りました。", ephemeral=True)

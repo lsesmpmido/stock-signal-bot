@@ -20,6 +20,7 @@ from discord.ext import commands as ext_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 
+import ai_trader
 import charts
 import commands
 import db
@@ -395,11 +396,24 @@ class StockBot(ext_commands.Bot):
         """監視銘柄・直近の提案銘柄・指数の確定した日足を DB に保存し、古い日足を削除する。"""
         codes = [s["ticker"] for s in await db.list_monitored()]
         codes += sorted(await db.recently_proposed_tickers(PRICE_SYNC_PROPOSAL_DAYS))
+        for owner in portfolio.OWNER_LABELS:
+            codes += [p["ticker"] for p in await db.vp_positions(owner)]
         codes += list(market.INDEX_CODES)
         daily = await market.get_daily(codes)
         pruned = await market.prune_old_prices()
         log.info("日足を保存しました (%d / %d 銘柄、古い日足 %d 行を削除)", len(daily), len(set(codes)), pruned)
         await self.save_snapshots()
+        try:
+            await self.run_ai_trader()
+        except Exception:
+            log.exception("AI トレーダーの判断でエラーが発生しました")
+
+    async def current_mode(self) -> ai_trader.Mode:
+        return ai_trader.MODES["normal"]
+
+    async def run_ai_trader(self) -> ai_trader.Decisions:
+        """大引け後に AI が売買を判断し、翌取引日の始値で約定する注文を出す（注文の時点では知らせない）。"""
+        return await ai_trader.decide(self.jev, await self.current_mode(), market.now_jst())
 
     async def save_snapshots(self) -> None:
         """両チームの今日の総資産を記録する（AI との勝負の月ごとの勝敗に使う）。"""
@@ -413,8 +427,16 @@ class StockBot(ext_commands.Bot):
     async def run_fill_job(self) -> None:
         executed = await orders.fill_open_orders(market.now_jst())
         mine = [e for e in executed if e.order["owner"] == "you"]
+        ai = [e for e in executed if e.order["owner"] == "ai"]
+        if not mine and not ai:
+            return
+        channel = await self._report_channel()
+        if ai:
+            await channel.send(embed=views.ai_fills_embed(ai, await self.current_mode(), market.now_jst()))
+            for e in ai:
+                await db.log_notification("ai_trade", e.order["ticker"], e.order["side"])
         if mine:
-            await (await self._report_channel()).send(embed=views.fills_embed(mine, "you"))
+            await channel.send(embed=views.fills_embed(mine, "you"))
             await db.log_notification("fill", detail=f"{len(mine)} 件")
 
     # ------------------------------------------------------------ モジュール3: 売買シグナル

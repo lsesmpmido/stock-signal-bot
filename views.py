@@ -12,6 +12,7 @@ from typing import Any
 import discord
 
 import db
+import ai_trader
 import market
 import orders
 import portfolio
@@ -310,6 +311,34 @@ def fills_embed(executed: list[orders.Executed], owner: str) -> discord.Embed:
                 f"（損益 {_yen(r.net, sign=True)} / {r.return_rate:+.1%}）"
             )
     embed.description = "\n".join(lines)
+    return embed
+
+
+def ai_fills_embed(executed: list[orders.Executed], mode: ai_trader.Mode, now) -> discord.Embed:
+    """AI の今日の売買（寄り付きで約定したもの）をまとめる。"""
+    embed = discord.Embed(title=f"🤖 AIの売買（{now:%m/%d} 寄り付き）{mode.label}", color=discord.Color.dark_teal())
+    lines = []
+    for e in executed:
+        o = e.order
+        conf = f"確信度 {o['confidence']:.0%}" if o["confidence"] is not None else None
+        if e.result is None:
+            lines.append(f"⚠️ {o['company_name']} ({o['ticker']}) の注文は約定しませんでした（{e.error}）")
+        elif isinstance(e.result, portfolio.BuyResult):
+            r = e.result
+            accounts = "・".join(portfolio.ACCOUNT_LABELS[f.account] for f in r.fills)
+            source = ai_trader.SOURCE_LABELS.get(o["source"] or "", o["source"] or "")
+            detail = " ・ ".join(x for x in (conf, f"候補: {source}" if source else None) if x)
+            lines.append(f"🟢 買い: {r.company_name} ({r.ticker}) {r.shares:,} 株 × {r.price:,.1f} 円（{accounts}）\n　{detail}")
+        else:
+            r = e.result
+            tax = f" ・ 税金 {_yen(r.tax)}" if r.account == "tokutei" and r.tax else ""
+            detail = " ・ ".join(x for x in (f"理由: {o['reason']}" if o["reason"] else None, conf) if x)
+            lines.append(
+                f"🔴 売り: {r.company_name} ({r.ticker}) {r.shares:,} 株 × {r.price:,.1f} 円"
+                f"（{portfolio.ACCOUNT_LABELS[r.account]}）\n　損益 {_yen(r.net, sign=True)}（{r.return_rate:+.1%}）"
+                f" ・ 保有 {r.held_days} 日{tax}\n　{detail}"
+            )
+    embed.description = "\n".join(lines)[:4000]
     return embed
 
 

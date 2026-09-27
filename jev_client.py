@@ -63,6 +63,45 @@ class JevJudge:
         )
         return Judgement(result.nouls["is_positive"].noul, result.scores["impact"].score)
 
+    async def should_buy(self, state: dict) -> float:
+        """AI トレーダー用: この銘柄を翌取引日の寄り付きで買うべきかの確信度（0〜1）。"""
+        result = await self._client.system_one(
+            state=state,
+            questions={
+                "buy": Noul(
+                    instructions=(
+                        "あなたは日本株を数週間〜数か月の期間で運用する個人投資家です。"
+                        "この銘柄を翌取引日の寄り付きで買うべきですか？ ニュースで急騰した直後の高値づかみは避け、"
+                        "材料の強さと、RSI・移動平均からの乖離・MACD などの値動きの状態のバランスで判断してください。"
+                    ),
+                    criteria={
+                        "true": "材料と値動きの両面から、今が買いのタイミング",
+                        "false": "割高・材料が弱い・トレンドが悪いなどの理由で、見送るか待つべき",
+                    },
+                )
+            },
+        )
+        return result.nouls["buy"].noul
+
+    async def should_sell(self, state: dict) -> float:
+        """AI トレーダー用: 保有中のこの銘柄を翌取引日の寄り付きで売るべきかの確信度（0〜1）。"""
+        result = await self._client.system_one(
+            state=state,
+            questions={
+                "sell": Noul(
+                    instructions=(
+                        "あなたは日本株を数週間〜数か月の期間で運用する個人投資家です。"
+                        "保有中のこの銘柄を翌取引日の寄り付きで売るべきですか？ 損益・保有期間・値動きの状態から判断してください。"
+                    ),
+                    criteria={
+                        "true": "利益確定・トレンドの悪化・買われすぎなどの理由で、売るべき",
+                        "false": "上昇の余地があり、持ち続けるべき",
+                    },
+                )
+            },
+        )
+        return result.nouls["sell"].noul
+
     async def aclose(self) -> None:
         await self._client.aclose()
 

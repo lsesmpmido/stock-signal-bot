@@ -72,7 +72,7 @@ class Review:
         return max(rows, key=lambda o: o.change) if highest else min(rows, key=lambda o: o.change)
 
 
-def _base_cutoff(proposed_at: datetime) -> date:
+def base_cutoff(proposed_at: datetime) -> date:
     """基準にする終値の日付の上限。"""
     local = proposed_at.astimezone(JST)
     return local.date() if local.time() >= CLOSE_TIME else local.date() - timedelta(days=1)
@@ -109,7 +109,7 @@ async def build(days: int = 5) -> Review:
     outcomes, waiting = [], 0
     for p in proposals:
         df = daily.get(p["ticker"])
-        result = _change(df, _base_cutoff(p["created_at"]), days) if df is not None else None
+        result = _change(df, base_cutoff(p["created_at"]), days) if df is not None else None
         if result is None:
             waiting += 1
             continue

@@ -23,7 +23,7 @@ MAX_LIST = 10
 RSI_NEAR = 5  # RSI がしきい値（30 / 70）まであとこの幅以内なら「接近」
 MA_NEAR = 0.01  # 25 日線と 75 日線の差がこの割合以内なら「接近」
 MACD_NEAR = 0.1  # MACD とシグナル線の差が、直近 60 日の平均的な差のこの割合以内なら「接近」
-KIND_LABELS = {"proposal": "提案", "signal": "売買シグナル", "delist": "自動解除", "report": "レポート", "fill": "約定"}
+KIND_LABELS = {"proposal": "提案", "signal": "売買シグナル", "delist": "自動解除", "report": "レポート", "fill": "約定", "ai_trade": "AIの売買"}
 
 
 @dataclass(frozen=True)

@@ -23,7 +23,7 @@ MAX_LIST = 10
 RSI_NEAR = 5  # RSI がしきい値（30 / 70）まであとこの幅以内なら「接近」
 MA_NEAR = 0.01  # 25 日線と 75 日線の差がこの割合以内なら「接近」
 MACD_NEAR = 0.1  # MACD とシグナル線の差が、直近 60 日の平均的な差のこの割合以内なら「接近」
-KIND_LABELS = {"proposal": "提案", "signal": "売買シグナル", "delist": "自動解除", "report": "レポート"}
+KIND_LABELS = {"proposal": "提案", "signal": "売買シグナル", "delist": "自動解除", "report": "レポート", "fill": "約定"}
 
 
 @dataclass(frozen=True)
@@ -128,7 +128,7 @@ def _ranking(moves: list[Move], n: int = 3) -> str:
 async def _targets() -> tuple[list[str], list[str], dict[str, str]]:
     """監視銘柄、仮想保有銘柄、銘柄名の対応。"""
     monitored = await db.list_monitored()
-    positions = await db.vp_positions()
+    positions = await db.vp_positions("you")
     names = {s["ticker"]: s["company_name"] for s in monitored}
     names.update({p["ticker"]: p["company_name"] for p in positions})
     held = list(dict.fromkeys(p["ticker"] for p in positions))
@@ -176,7 +176,7 @@ async def close(now: datetime) -> discord.Embed:
     signals_today = await db.notifications_since(_day_start(now), "signal")
     embed.add_field(name="今日のシグナル", value=f"{len(signals_today)} 件", inline=True)
 
-    s = await portfolio.summary()
+    s = await portfolio.summary("you")
     day_change = 0.0
     for h in s.holdings:
         df = daily.get(h.ticker)
@@ -222,7 +222,7 @@ async def weekly(now: datetime) -> discord.Embed:
         review_lines.append(f"⏭️ スキップ {skipped.count} 件 平均 {skipped.change:+.1%}")
     embed.add_field(name="提案の答え合わせ（5営業日後）", value="\n".join(review_lines) + "\n詳しくは `/review`", inline=False)
 
-    s = await portfolio.summary()
+    s = await portfolio.summary("you")
     pf = [f"総資産 {s.total_value:,.0f} 円（通算 {s.total_return:+.2%}）"]
     if s.topix_change is not None:
         diff = s.total_return - s.topix_change

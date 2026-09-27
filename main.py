@@ -25,6 +25,8 @@ import commands
 import db
 import market
 import news
+import orders
+import portfolio
 import reports
 import signals
 import views
@@ -54,6 +56,8 @@ PRICE_SYNC_TIME = time(16, 0)
 # 答え合わせなどで後から株価を使うため、直近この日数に提案した銘柄の日足も保存しておく
 PRICE_SYNC_PROPOSAL_DAYS = 35
 # 定番レポートの時刻。朝は 8:30 の提案ジョブの後、大引けは 16:00 の日足保存の後にする
+# 取引時間外に出た注文を始値で約定させる時刻。データの遅れで始値がまだ取れない銘柄は次の時刻に回す
+FILL_TIMES = [time(9, 30), time(10, 0), time(11, 0), time(13, 0)]
 REPORT_TIMES = {"morning": time(8, 45), "close": time(16, 5), "weekly": time(16, 10)}
 
 
@@ -84,6 +88,12 @@ def price_sync_slots(day: datetime) -> list[datetime]:
     return [datetime.combine(day.date(), PRICE_SYNC_TIME, JST)] if market.is_trading_day(day.date()) else []
 
 
+def fill_slots(day: datetime) -> list[datetime]:
+    if not market.is_trading_day(day.date()):
+        return []
+    return [datetime.combine(day.date(), t, JST) for t in FILL_TIMES]
+
+
 def report_slots(kind: str, day: datetime) -> list[datetime]:
     d = day.date()
     if kind == "weekly":
@@ -112,6 +122,7 @@ class StockBot(ext_commands.Bot):
         self._relations_lock = asyncio.Lock()
         self._price_sync_lock = asyncio.Lock()
         self._report_lock = asyncio.Lock()
+        self._fill_lock = asyncio.Lock()
         self._background: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------ 起動・終了
@@ -189,6 +200,11 @@ class StockBot(ext_commands.Bot):
         if slot and slot != settings.get("_last_price_sync_slot") and not self._price_sync_lock.locked():
             await db.set_setting("_last_price_sync_slot", slot)
             self._spawn(self._guarded(self._price_sync_lock, self.run_price_sync_job))
+
+        slot = due_slot(fill_slots(now), now)
+        if slot and slot != settings.get("_last_fill_slot") and not self._fill_lock.locked():
+            await db.set_setting("_last_fill_slot", slot)
+            self._spawn(self._guarded(self._fill_lock, self.run_fill_job))
 
         for kind in reports.BUILDERS:
             if settings.get(f"report_{kind}", "on") != "on":
@@ -383,6 +399,23 @@ class StockBot(ext_commands.Bot):
         daily = await market.get_daily(codes)
         pruned = await market.prune_old_prices()
         log.info("日足を保存しました (%d / %d 銘柄、古い日足 %d 行を削除)", len(daily), len(set(codes)), pruned)
+        await self.save_snapshots()
+
+    async def save_snapshots(self) -> None:
+        """両チームの今日の総資産を記録する（AI との勝負の月ごとの勝敗に使う）。"""
+        today = market.now_jst().date()
+        for owner in portfolio.OWNER_LABELS:
+            s = await portfolio.summary(owner)
+            await db.vp_save_snapshot(owner, today, s.total_value, s.deposits)
+
+    # ------------------------------------------------------------ 注文の約定（取引時間外の注文を翌取引日の始値で）
+
+    async def run_fill_job(self) -> None:
+        executed = await orders.fill_open_orders(market.now_jst())
+        mine = [e for e in executed if e.order["owner"] == "you"]
+        if mine:
+            await (await self._report_channel()).send(embed=views.fills_embed(mine, "you"))
+            await db.log_notification("fill", detail=f"{len(mine)} 件")
 
     # ------------------------------------------------------------ モジュール3: 売買シグナル
 

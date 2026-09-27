@@ -1,4 +1,4 @@
-"""スラッシュコマンド: /settings, /watch add|remove|list, /buy, /sell, /portfolio, /review, /test proposal|signal|report"""
+"""スラッシュコマンド: /settings, /watch add|remove|list, /buy, /sell, /portfolio, /orders, /review, /test proposal|signal|report"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from discord import app_commands
 
 import db
 import market
+import orders
 import portfolio
 import reports
 import review
@@ -173,7 +174,7 @@ class TestGroup(
 async def _held_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     current = current.strip()
     seen = {}
-    for p in await db.vp_positions():
+    for p in await db.vp_positions("you"):
         seen.setdefault(p["ticker"], p["company_name"])
     return [
         app_commands.Choice(name=f"{code} {name}"[:100], value=code)
@@ -195,14 +196,14 @@ async def buy_command(interaction: discord.Interaction, code: str, amount: float
         yen = amount * 10_000 if amount is not None else await portfolio.default_amount()
         if yen <= 0:
             raise portfolio.TradeError("購入金額は 0 より大きくしてください。")
-        result = await portfolio.buy(code, name, yen)
+        placed = await orders.place_buy("you", code, name, yen)
     except portfolio.TradeError as exc:
         await interaction.followup.send(f"❌ {exc}")
         return
     except Exception as exc:
         await interaction.followup.send(f"⚠️ 仮想購入でエラーが発生しました: `{exc}`")
         raise
-    await interaction.followup.send(embed=views.buy_embed(result))
+    await interaction.followup.send(embed=views.placed_embed(placed, "buy", code, name))
 
 
 @app_commands.command(name="sell", description="仮想で売ります（株数を省略すると全部、口座を省略すると特定口座から）")
@@ -219,23 +220,27 @@ async def sell_command(
     account: app_commands.Choice[str] | None = None,
 ) -> None:
     await interaction.response.defer(thinking=True)
+    code = normalize_code(code)
     try:
-        result = await portfolio.sell(normalize_code(code), shares, account.value if account else None)
+        placed = await orders.place_sell("you", code, shares, account.value if account else None)
+        name = await views.company_name(interaction.client, code)
     except portfolio.TradeError as exc:
         await interaction.followup.send(f"❌ {exc}")
         return
     except Exception as exc:
         await interaction.followup.send(f"⚠️ 仮想売却でエラーが発生しました: `{exc}`")
         raise
-    await interaction.followup.send(embed=views.sell_embed(result))
+    await interaction.followup.send(embed=views.placed_embed(placed, "sell", code, name))
 
 
 @app_commands.command(name="portfolio", description="仮想ポートフォリオの保有・損益・NISA 枠の残りを表示します")
+@app_commands.describe(team="表示するチーム（既定: あなた）")
+@app_commands.choices(team=[app_commands.Choice(name="あなた", value="you"), app_commands.Choice(name="AI", value="ai")])
 @app_commands.default_permissions(manage_guild=True)
-async def portfolio_command(interaction: discord.Interaction) -> None:
+async def portfolio_command(interaction: discord.Interaction, team: app_commands.Choice[str] | None = None) -> None:
     await interaction.response.defer(thinking=True)
     try:
-        summary = await portfolio.summary()
+        summary = await portfolio.summary(team.value if team else "you")
     except Exception as exc:
         await interaction.followup.send(f"⚠️ ポートフォリオの取得でエラーが発生しました: `{exc}`")
         raise
@@ -258,6 +263,15 @@ async def review_command(interaction: discord.Interaction, period: app_commands.
     await interaction.followup.send(embed=views.review_embed(result))
 
 
+@app_commands.command(name="orders", description="取引時間外に出した未約定の注文を表示・取り消します")
+@app_commands.default_permissions(manage_guild=True)
+async def orders_command(interaction: discord.Interaction) -> None:
+    open_orders = await db.vp_orders("open", "you")
+    await interaction.response.send_message(
+        embed=views.orders_embed(open_orders), view=views.OrdersView(open_orders), ephemeral=True
+    )
+
+
 def setup(tree: app_commands.CommandTree) -> None:
     tree.add_command(settings_command)
     tree.add_command(WatchGroup())
@@ -265,4 +279,5 @@ def setup(tree: app_commands.CommandTree) -> None:
     tree.add_command(buy_command)
     tree.add_command(sell_command)
     tree.add_command(portfolio_command)
+    tree.add_command(orders_command)
     tree.add_command(review_command)

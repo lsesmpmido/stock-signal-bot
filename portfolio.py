@@ -1,10 +1,12 @@
-"""仮想売買（新NISA 成長投資枠＋特定口座）。
+"""仮想売買（新NISA 成長投資枠＋特定口座）。自分（you）と AI（ai）が同じルールの別々の口座で運用する。
 
-- 元手 240 万円。現金は 2 つの口座で共通
+- 元手 240 万円。現金は 2 つの口座で共通。毎年 1 月の追加入金で増える
 - 買うときは NISA を優先し、その年の NISA 枠（購入額の合計 240 万円）を超える分は特定口座で買う
 - NISA 枠は売っても同じ年には戻らず、翌年 1 月に 240 万円に戻る
 - 特定口座の売却益には 20.315% の税金がかかる。同じ年の損益は相殺し、損が出たら払い過ぎの税金を戻す
 - 手数料は売買代金 × vp_fee_rate。特定口座では利益から差し引いてから税金を計算する
+- 取引時間中は最新の株価ですぐ約定し、取引時間外は注文として受け付けて翌取引日の始値で約定する
+  （終値を見てから、その終値で売買できないようにするため）
 - 監視（通知）とは別の機能で、仮想で買っても監視対象には入らない
 """
 
@@ -13,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, time
 
 import db
 import market
@@ -21,10 +23,12 @@ from market import JST
 
 NISA_ANNUAL_LIMIT = 2_400_000
 TAX_RATE = 0.20315
-INITIAL_CASH = 2_400_000
 ACCOUNT_LABELS = {"nisa": "NISA", "tokutei": "特定口座"}
+OWNER_LABELS = {"you": "あなた", "ai": "AI"}
+MARKET_OPEN = time(9, 0)
+MARKET_CLOSE = time(15, 30)
 
-_lock = asyncio.Lock()  # ボタンの連打などで売買が同時に走らないようにする
+_lock = asyncio.Lock()  # ボタンの連打や、AI と自分の売買が同時に走らないようにする
 
 
 class TradeError(Exception):
@@ -41,6 +45,7 @@ class Fill:
 
 @dataclass
 class BuyResult:
+    owner: str
     ticker: str
     company_name: str
     price: float
@@ -48,9 +53,14 @@ class BuyResult:
     cash_after: float
     nisa_left: float
 
+    @property
+    def shares(self) -> int:
+        return sum(f.shares for f in self.fills)
+
 
 @dataclass
 class SellResult:
+    owner: str
     ticker: str
     company_name: str
     account: str
@@ -82,6 +92,7 @@ class Holding:
     shares: int
     cost: float
     price: float | None
+    opened_at: datetime
 
     @property
     def value(self) -> float | None:
@@ -91,10 +102,16 @@ class Holding:
     def unrealized(self) -> float | None:
         return None if self.value is None else self.value - self.cost
 
+    @property
+    def return_rate(self) -> float | None:
+        return None if self.unrealized is None or not self.cost else self.unrealized / self.cost
+
 
 @dataclass
 class Summary:
+    owner: str
     cash: float
+    deposits: float
     holdings: list[Holding]
     nisa_left: float
     year_tax: float
@@ -108,41 +125,56 @@ class Summary:
 
     @property
     def total_return(self) -> float:
-        return self.total_value / INITIAL_CASH - 1
+        return self.total_value / self.deposits - 1 if self.deposits else 0.0
 
 
 def _year_start(now: datetime) -> datetime:
     return datetime(now.year, 1, 1, tzinfo=JST)
 
 
-async def _latest_price(ticker: str) -> float:
-    daily = (await market.get_daily([ticker])).get(ticker)
-    if daily is None or daily.empty:
-        raise TradeError(f"{ticker} の株価を取得できませんでした。時間をおいて再度お試しください。")
-    return float(daily["Close"].iloc[-1])
-
-
-async def _settings() -> tuple[float, float]:
+async def _settings(owner: str) -> tuple[float, float]:
     s = await db.get_all_settings()
-    return float(s["vp_cash"]), float(s["vp_fee_rate"])
+    return float(s[db.CASH_KEYS[owner]]), float(s["vp_fee_rate"])
 
 
 async def default_amount() -> float:
     return float((await db.get_all_settings())["vp_default_amount"])
 
 
-async def buy(ticker: str, company_name: str, amount: float) -> BuyResult:
-    """amount 円以内で買える最大の株数を買う（1 株単位）。"""
+async def live_price(ticker: str) -> float | None:
+    """取引時間中なら、今日の最新株価（約 20 分遅れ）。取引時間外や今日の株価がまだないときは None。
+
+    None のときは、注文として受け付けて翌取引日の始値で約定させる。
+    """
+    now = market.now_jst()
+    if not market.is_trading_day(now.date()) or not (MARKET_OPEN <= now.time() < MARKET_CLOSE):
+        return None
+    daily = (await market.get_daily([ticker])).get(ticker)
+    if daily is None or daily.empty or daily.index[-1].date() != now.date():
+        return None
+    return float(daily["Close"].iloc[-1])
+
+
+async def buy(
+    owner: str,
+    ticker: str,
+    company_name: str,
+    amount: float,
+    price: float,
+    reason: str | None = None,
+    confidence: float | None = None,
+    traded_at: datetime | None = None,
+) -> BuyResult:
+    """price 円で、amount 円以内で買える最大の株数を買う（1 株単位）。"""
     async with _lock:
-        price = await _latest_price(ticker)
-        cash, fee_rate = await _settings()
+        cash, fee_rate = await _settings(owner)
         budget = min(amount, cash)
         shares = math.floor(budget / (price * (1 + fee_rate)))
         if shares <= 0:
             raise TradeError(
                 f"1 株も買えません（株価 {price:,.0f} 円、指定額 {amount:,.0f} 円、現金 {cash:,.0f} 円）。"
             )
-        totals = await db.vp_year_totals(_year_start(market.now_jst()))
+        totals = await db.vp_year_totals(owner, _year_start(traded_at or market.now_jst()))
         nisa_left = max(0.0, NISA_ANNUAL_LIMIT - totals["nisa_bought"])
         nisa_shares = min(shares, math.floor(nisa_left / price))
         plan = [("nisa", nisa_shares), ("tokutei", shares - nisa_shares)]
@@ -153,7 +185,7 @@ async def buy(ticker: str, company_name: str, amount: float) -> BuyResult:
                 continue
             trade_amount = round(price * n)
             fee = round(trade_amount * fee_rate)
-            existing = next(iter(p for p in await db.vp_positions(ticker) if p["account"] == account), None)
+            existing = next(iter(p for p in await db.vp_positions(owner, ticker) if p["account"] == account), None)
             position = {
                 "account": account,
                 "ticker": ticker,
@@ -170,43 +202,56 @@ async def buy(ticker: str, company_name: str, amount: float) -> BuyResult:
                 "price": price,
                 "amount": trade_amount,
                 "fee": fee,
+                "reason": reason,
+                "confidence": confidence,
             }
-            await db.vp_record_trade(trade, -(trade_amount + fee), position)
+            await db.vp_record_trade(owner, trade, -(trade_amount + fee), position, traded_at=traded_at)
             fills.append(Fill(account, n, trade_amount, fee))
             if account == "nisa":
                 nisa_left -= trade_amount
-        cash_after, _ = await _settings()
-        return BuyResult(ticker, company_name, price, fills, cash_after, max(0.0, nisa_left))
+        cash_after, _ = await _settings(owner)
+        return BuyResult(owner, ticker, company_name, price, fills, cash_after, max(0.0, nisa_left))
 
 
-async def sell(ticker: str, shares: int | None = None, account: str | None = None) -> SellResult:
-    """保有を売る。shares を省略すると全株、account を省略すると特定口座から先に売る。"""
+def pick_position(positions: list[dict], account: str | None) -> dict:
+    """売る保有を選ぶ。口座の指定がなければ、NISA は長く持つ前提として特定口座から売る。"""
+    if account:
+        positions = [p for p in positions if p["account"] == account]
+    if not positions:
+        raise TradeError("その銘柄を" + (f"{ACCOUNT_LABELS[account]}で" if account else "") + "保有していません。")
+    return sorted(positions, key=lambda p: p["account"] != "tokutei")[0]
+
+
+async def sell(
+    owner: str,
+    ticker: str,
+    price: float,
+    shares: int | None = None,
+    account: str | None = None,
+    reason: str | None = None,
+    confidence: float | None = None,
+    traded_at: datetime | None = None,
+) -> SellResult:
+    """price 円で保有を売る。shares を省略すると全株、account を省略すると特定口座から先に売る。"""
     async with _lock:
-        positions = await db.vp_positions(ticker)
-        if account:
-            positions = [p for p in positions if p["account"] == account]
-        if not positions:
-            where = f"{ACCOUNT_LABELS[account]}で" if account else ""
-            raise TradeError(f"{ticker} を{where}保有していません。")
-        # 口座の指定がなければ、NISA は長く持つ前提として特定口座から売る
-        position = sorted(positions, key=lambda p: p["account"] != "tokutei")[0]
+        position = pick_position(await db.vp_positions(owner, ticker), account)
         n = position["shares"] if shares is None else shares
         if n <= 0 or n > position["shares"]:
             raise TradeError(
                 f"{ACCOUNT_LABELS[position['account']]}の保有は {position['shares']} 株です（指定: {n} 株）。"
             )
 
-        price = await _latest_price(ticker)
-        _, fee_rate = await _settings()
+        _, fee_rate = await _settings(owner)
         amount = round(price * n)
         fee = round(amount * fee_rate)
         cost = position["cost"] * n / position["shares"]
         realized = amount - fee - cost
 
+        when = traded_at or market.now_jst()
         tax = 0.0
         if position["account"] == "tokutei":
             # 同じ年の損益を相殺したうえでの源泉徴収額の増減（損が出たら還付でマイナスになる）
-            before = (await db.vp_year_totals(_year_start(market.now_jst())))["tokutei_realized"]
+            before = (await db.vp_year_totals(owner, _year_start(when)))["tokutei_realized"]
             tax = round((max(0.0, before + realized) - max(0.0, before)) * TAX_RATE)
 
         remaining = position["shares"] - n
@@ -221,13 +266,18 @@ async def sell(ticker: str, shares: int | None = None, account: str | None = Non
             "fee": fee,
             "realized": realized,
             "tax": tax,
+            "reason": reason,
+            "confidence": confidence,
         }
         updated = {**position, "shares": remaining, "cost": position["cost"] - cost} if remaining else None
-        await db.vp_record_trade(trade, amount - fee - tax, updated, delete_position=remaining == 0)
+        await db.vp_record_trade(
+            owner, trade, amount - fee - tax, updated, delete_position=remaining == 0, traded_at=traded_at
+        )
 
         opened = position["opened_at"].astimezone(JST).date()
-        cash_after, _ = await _settings()
+        cash_after, _ = await _settings(owner)
         return SellResult(
+            owner=owner,
             ticker=ticker,
             company_name=position["company_name"],
             account=position["account"],
@@ -238,7 +288,7 @@ async def sell(ticker: str, shares: int | None = None, account: str | None = Non
             cost=cost,
             realized=realized,
             tax=tax,
-            held_days=(market.now_jst().date() - opened).days,
+            held_days=(when.astimezone(JST).date() - opened).days,
             topix_change=await _topix_change(opened),
             cash_after=cash_after,
         )
@@ -254,8 +304,8 @@ async def _topix_change(since: date) -> float | None:
     return float(topix["Close"].iloc[-1] / base - 1)
 
 
-async def summary() -> Summary:
-    positions = await db.vp_positions()
+async def summary(owner: str) -> Summary:
+    positions = await db.vp_positions(owner)
     tickers = sorted({p["ticker"] for p in positions})
     daily = await market.get_daily(tickers) if tickers else {}
     holdings = [
@@ -266,14 +316,17 @@ async def summary() -> Summary:
             p["shares"],
             p["cost"],
             float(daily[p["ticker"]]["Close"].iloc[-1]) if p["ticker"] in daily else None,
+            p["opened_at"],
         )
         for p in positions
     ]
     settings = await db.get_all_settings()
-    totals = await db.vp_year_totals(_year_start(market.now_jst()))
+    totals = await db.vp_year_totals(owner, _year_start(market.now_jst()))
     started_at = datetime.fromisoformat(settings["vp_started_at"])
     return Summary(
-        cash=float(settings["vp_cash"]),
+        owner=owner,
+        cash=float(settings[db.CASH_KEYS[owner]]),
+        deposits=float(settings[db.DEPOSIT_KEYS[owner]]),
         holdings=holdings,
         nisa_left=max(0.0, NISA_ANNUAL_LIMIT - totals["nisa_bought"]),
         year_tax=totals["tax"],

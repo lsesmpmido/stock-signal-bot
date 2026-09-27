@@ -27,7 +27,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "report_close": "on",
     "report_weekly": "on",
     # 仮想売買
-    "vp_cash": "2400000",  # 現金残高（円）。元手は新NISA 成長投資枠の年間上限と同じ 240 万円
+    "vp_cash": "2400000",  # 自分の現金残高（円）。元手は新NISA 成長投資枠の年間上限と同じ 240 万円
+    "vp_cash_ai": "2400000",  # AI の現金残高（円）
+    "vp_deposits_you": "2400000",  # 入金額の合計（円）。成績は入金額の合計に対する損益で計算する
+    "vp_deposits_ai": "2400000",
     "vp_fee_rate": "0",  # 売買手数料（売買代金に対する割合。例: 0.0022 = 0.22%）
     "vp_default_amount": "200000",  # 金額を省略したときの購入額（円）
 }
@@ -75,16 +78,18 @@ CREATE TABLE IF NOT EXISTS company_relations (
     PRIMARY KEY (source, target, relation_type)
 );
 CREATE TABLE IF NOT EXISTS vp_positions (
+    owner        TEXT NOT NULL DEFAULT 'you',  -- 'you' / 'ai'
     account      TEXT NOT NULL,  -- 'nisa' / 'tokutei'
     ticker       TEXT NOT NULL,
     company_name TEXT NOT NULL,
     shares       INTEGER NOT NULL,
     cost         DOUBLE PRECISION NOT NULL,  -- 取得費の合計（購入代金＋手数料）
     opened_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (account, ticker)
+    PRIMARY KEY (owner, account, ticker)
 );
 CREATE TABLE IF NOT EXISTS vp_trades (
     id           BIGSERIAL PRIMARY KEY,
+    owner        TEXT NOT NULL DEFAULT 'you',
     account      TEXT NOT NULL,
     ticker       TEXT NOT NULL,
     company_name TEXT NOT NULL,
@@ -95,7 +100,46 @@ CREATE TABLE IF NOT EXISTS vp_trades (
     fee          DOUBLE PRECISION NOT NULL DEFAULT 0,
     realized     DOUBLE PRECISION,  -- 売却時の損益（税引前、手数料込み）
     tax          DOUBLE PRECISION NOT NULL DEFAULT 0,  -- 源泉徴収額（マイナスは還付）
+    reason       TEXT,  -- 売買の理由（AI の判断・損切り・入れ替えなど）
+    confidence   DOUBLE PRECISION,  -- AI の判断の確信度
     traded_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- 持ち主の列がなかった頃の DB を移行する（既存の保有・履歴はすべて自分の分とする）。何度実行しても問題ない
+ALTER TABLE vp_positions ADD COLUMN IF NOT EXISTS owner TEXT NOT NULL DEFAULT 'you';
+ALTER TABLE vp_trades ADD COLUMN IF NOT EXISTS owner TEXT NOT NULL DEFAULT 'you';
+ALTER TABLE vp_trades ADD COLUMN IF NOT EXISTS reason TEXT;
+ALTER TABLE vp_trades ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION;
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM information_schema.key_column_usage
+        WHERE table_name = 'vp_positions' AND constraint_name = 'vp_positions_pkey') < 3 THEN
+        ALTER TABLE vp_positions DROP CONSTRAINT vp_positions_pkey;
+        ALTER TABLE vp_positions ADD PRIMARY KEY (owner, account, ticker);
+    END IF;
+END $$;
+CREATE TABLE IF NOT EXISTS vp_orders (
+    id           BIGSERIAL PRIMARY KEY,
+    owner        TEXT NOT NULL,
+    side         TEXT NOT NULL,  -- 'buy' / 'sell'
+    ticker       TEXT NOT NULL,
+    company_name TEXT NOT NULL,
+    amount       DOUBLE PRECISION,  -- 買い: 購入金額（円）
+    shares       INTEGER,  -- 売り: 株数（NULL なら全株）
+    account      TEXT,  -- 売り: 口座（NULL なら特定口座から）
+    reason       TEXT,
+    confidence   DOUBLE PRECISION,
+    source       TEXT,  -- AI の買い: 候補に入った理由（proposal / watch / your_holding）
+    status       TEXT NOT NULL DEFAULT 'open',  -- open / filled / failed / cancelled / expired
+    note         TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    filled_at    TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS vp_snapshots (
+    owner       TEXT NOT NULL,
+    date        DATE NOT NULL,
+    total_value DOUBLE PRECISION NOT NULL,
+    deposits    DOUBLE PRECISION NOT NULL,  -- その時点までの入金額の合計
+    PRIMARY KEY (owner, date)
 );
 CREATE TABLE IF NOT EXISTS notification_log (
     id      BIGSERIAL PRIMARY KEY,
@@ -124,6 +168,8 @@ ALTER TABLE company_relations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE price_daily      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE vp_positions     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE vp_trades        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vp_orders        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vp_snapshots     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notification_log ENABLE ROW LEVEL SECURITY;
 """
 
@@ -400,19 +446,25 @@ async def prune_prices(before: date) -> int:
         return cur.rowcount
 
 
-# ---------------------------------------------------------------- 仮想売買（vp_positions / vp_trades）
+# ---------------------------------------------------------------- 仮想売買（vp_positions / vp_trades / vp_orders / vp_snapshots）
+
+CASH_KEYS = {"you": "vp_cash", "ai": "vp_cash_ai"}
+DEPOSIT_KEYS = {"you": "vp_deposits_you", "ai": "vp_deposits_ai"}
 
 
-async def vp_positions(ticker: str | None = None) -> list[dict[str, Any]]:
+async def vp_positions(owner: str, ticker: str | None = None) -> list[dict[str, Any]]:
     async with _pool_or_raise().connection() as conn:
         if ticker is None:
-            sql, params = "SELECT * FROM vp_positions ORDER BY opened_at", ()
+            sql, params = "SELECT * FROM vp_positions WHERE owner = %s ORDER BY opened_at", (owner,)
         else:
-            sql, params = "SELECT * FROM vp_positions WHERE ticker = %s ORDER BY account", (ticker,)
+            sql, params = (
+                "SELECT * FROM vp_positions WHERE owner = %s AND ticker = %s ORDER BY account",
+                (owner, ticker),
+            )
         return await (await conn.execute(sql, params)).fetchall()
 
 
-async def vp_year_totals(year_start: datetime) -> dict[str, float]:
+async def vp_year_totals(owner: str, year_start: datetime) -> dict[str, float]:
     """year_start 以降の、NISA の購入額合計・特定口座の実現損益合計・税金合計・手数料合計。"""
     async with _pool_or_raise().connection() as conn:
         row = await (
@@ -421,15 +473,30 @@ async def vp_year_totals(year_start: datetime) -> dict[str, float]:
                 "COALESCE(SUM(amount) FILTER (WHERE account = 'nisa' AND side = 'buy'), 0) AS nisa_bought, "
                 "COALESCE(SUM(realized) FILTER (WHERE account = 'tokutei' AND side = 'sell'), 0) AS tokutei_realized, "
                 "COALESCE(SUM(tax), 0) AS tax, COALESCE(SUM(fee), 0) AS fee "
-                "FROM vp_trades WHERE traded_at >= %s",
-                (year_start,),
+                "FROM vp_trades WHERE owner = %s AND traded_at >= %s",
+                (owner, year_start),
             )
         ).fetchone()
     return {k: float(v) for k, v in row.items()}
 
 
+async def vp_trades(owner: str, since: datetime | None = None) -> list[dict[str, Any]]:
+    async with _pool_or_raise().connection() as conn:
+        return await (
+            await conn.execute(
+                "SELECT * FROM vp_trades WHERE owner = %s AND traded_at >= %s ORDER BY traded_at",
+                (owner, since or datetime(2000, 1, 1, tzinfo=timezone.utc)),
+            )
+        ).fetchall()
+
+
 async def vp_record_trade(
-    trade: dict[str, Any], cash_delta: float, position: dict[str, Any] | None, delete_position: bool = False
+    owner: str,
+    trade: dict[str, Any],
+    cash_delta: float,
+    position: dict[str, Any] | None,
+    delete_position: bool = False,
+    traded_at: datetime | None = None,
 ) -> None:
     """売買 1 件を記録し、現金残高と保有を更新する（すべて 1 つのトランザクションで行う）。
 
@@ -438,26 +505,100 @@ async def vp_record_trade(
     async with _pool_or_raise().connection() as conn:
         async with conn.transaction():
             await conn.execute(
-                "INSERT INTO vp_trades (account, ticker, company_name, side, shares, price, amount, fee, realized, tax) "
-                "VALUES (%(account)s, %(ticker)s, %(company_name)s, %(side)s, %(shares)s, %(price)s, %(amount)s, "
-                "%(fee)s, %(realized)s, %(tax)s)",
-                {"realized": None, "tax": 0, **trade},
+                "INSERT INTO vp_trades (owner, account, ticker, company_name, side, shares, price, amount, fee, "
+                "realized, tax, reason, confidence, traded_at) "
+                "VALUES (%(owner)s, %(account)s, %(ticker)s, %(company_name)s, %(side)s, %(shares)s, %(price)s, "
+                "%(amount)s, %(fee)s, %(realized)s, %(tax)s, %(reason)s, %(confidence)s, %(traded_at)s)",
+                {
+                    "realized": None,
+                    "tax": 0,
+                    "reason": None,
+                    "confidence": None,
+                    **trade,
+                    "owner": owner,
+                    "traded_at": traded_at or datetime.now(timezone.utc),
+                },
             )
             await conn.execute(
-                "UPDATE user_settings SET value = (value::double precision + %s)::text WHERE key = 'vp_cash'",
-                (cash_delta,),
+                "UPDATE user_settings SET value = (value::double precision + %s)::text WHERE key = %s",
+                (cash_delta, CASH_KEYS[owner]),
             )
             if delete_position:
                 await conn.execute(
-                    "DELETE FROM vp_positions WHERE account = %s AND ticker = %s", (trade["account"], trade["ticker"])
+                    "DELETE FROM vp_positions WHERE owner = %s AND account = %s AND ticker = %s",
+                    (owner, trade["account"], trade["ticker"]),
                 )
             elif position is not None:
                 await conn.execute(
-                    "INSERT INTO vp_positions (account, ticker, company_name, shares, cost) "
-                    "VALUES (%(account)s, %(ticker)s, %(company_name)s, %(shares)s, %(cost)s) "
-                    "ON CONFLICT (account, ticker) DO UPDATE SET shares = EXCLUDED.shares, cost = EXCLUDED.cost",
-                    position,
+                    "INSERT INTO vp_positions (owner, account, ticker, company_name, shares, cost, opened_at) "
+                    "VALUES (%(owner)s, %(account)s, %(ticker)s, %(company_name)s, %(shares)s, %(cost)s, %(opened_at)s) "
+                    "ON CONFLICT (owner, account, ticker) DO UPDATE SET shares = EXCLUDED.shares, cost = EXCLUDED.cost",
+                    {"opened_at": traded_at or datetime.now(timezone.utc), **position, "owner": owner},
                 )
+
+
+async def vp_deposit(owner: str, amount: float) -> None:
+    """現金を入金し、入金額の合計も増やす。"""
+    async with _pool_or_raise().connection() as conn:
+        async with conn.transaction():
+            for key in (CASH_KEYS[owner], DEPOSIT_KEYS[owner]):
+                await conn.execute(
+                    "UPDATE user_settings SET value = (value::double precision + %s)::text WHERE key = %s",
+                    (amount, key),
+                )
+
+
+async def vp_add_order(order: dict[str, Any]) -> int:
+    fields = {"amount": None, "shares": None, "account": None, "reason": None, "confidence": None, "source": None}
+    async with _pool_or_raise().connection() as conn:
+        row = await (
+            await conn.execute(
+                "INSERT INTO vp_orders (owner, side, ticker, company_name, amount, shares, account, reason, confidence, source) "
+                "VALUES (%(owner)s, %(side)s, %(ticker)s, %(company_name)s, %(amount)s, %(shares)s, %(account)s, "
+                "%(reason)s, %(confidence)s, %(source)s) RETURNING id",
+                {**fields, **order},
+            )
+        ).fetchone()
+    return row["id"]
+
+
+async def vp_orders(status: str = "open", owner: str | None = None) -> list[dict[str, Any]]:
+    async with _pool_or_raise().connection() as conn:
+        if owner is None:
+            sql, params = "SELECT * FROM vp_orders WHERE status = %s ORDER BY created_at", (status,)
+        else:
+            sql, params = (
+                "SELECT * FROM vp_orders WHERE status = %s AND owner = %s ORDER BY created_at",
+                (status, owner),
+            )
+        return await (await conn.execute(sql, params)).fetchall()
+
+
+async def vp_update_order(order_id: int, status: str, note: str | None = None) -> bool:
+    """注文の状態を変える。未約定（open）の注文だけを対象にし、変えられたら True。"""
+    async with _pool_or_raise().connection() as conn:
+        cur = await conn.execute(
+            "UPDATE vp_orders SET status = %s, note = %s, filled_at = CASE WHEN %s = 'filled' THEN now() END "
+            "WHERE id = %s AND status = 'open'",
+            (status, note, status, order_id),
+        )
+        return cur.rowcount > 0
+
+
+async def vp_save_snapshot(owner: str, day: date, total_value: float, deposits: float) -> None:
+    async with _pool_or_raise().connection() as conn:
+        await conn.execute(
+            "INSERT INTO vp_snapshots (owner, date, total_value, deposits) VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (owner, date) DO UPDATE SET total_value = EXCLUDED.total_value, deposits = EXCLUDED.deposits",
+            (owner, day, total_value, deposits),
+        )
+
+
+async def vp_snapshots(owner: str) -> list[dict[str, Any]]:
+    async with _pool_or_raise().connection() as conn:
+        return await (
+            await conn.execute("SELECT * FROM vp_snapshots WHERE owner = %s ORDER BY date", (owner,))
+        ).fetchall()
 
 
 # ---------------------------------------------------------------- notification_log

@@ -13,6 +13,7 @@ import discord
 
 import db
 import market
+import orders
 import portfolio
 import review
 from market import JST
@@ -181,14 +182,14 @@ class VirtualBuyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"vp:
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             name = await company_name(interaction.client, self.code)
-            result = await portfolio.buy(self.code, name, await portfolio.default_amount())
+            placed = await orders.place_buy("you", self.code, name, await portfolio.default_amount())
         except portfolio.TradeError as exc:
             await interaction.followup.send(f"❌ {exc}", ephemeral=True)
             return
         except Exception as exc:
             await interaction.followup.send(f"⚠️ 仮想購入でエラーが発生しました: `{exc}`", ephemeral=True)
             raise
-        await interaction.followup.send(embed=buy_embed(result), ephemeral=True)
+        await interaction.followup.send(embed=placed_embed(placed, "buy", self.code, name), ephemeral=True)
 
 
 # ---------------------------------------------------------------- 仮想売買の表示
@@ -204,11 +205,25 @@ def _yen(v: float, sign: bool = False) -> str:
     return f"{v:+,.0f} 円" if sign else f"{v:,.0f} 円"
 
 
-def buy_embed(r: portfolio.BuyResult) -> discord.Embed:
-    shares = sum(f.shares for f in r.fills)
+def placed_embed(placed: orders.Placed, side: str, code: str, name: str) -> discord.Embed:
+    """すぐ約定したなら売買の結果、取引時間外なら注文の受付を表示する。"""
+    if placed.result is not None:
+        return buy_embed(placed.result) if side == "buy" else sell_embed(placed.result)
+    action = "購入" if side == "buy" else "売却"
+    return discord.Embed(
+        title=f"📝 {name} ({code}) の仮想{action}注文を受け付けました",
+        description=(
+            "取引時間外のため、翌取引日の始値で約定します（終値を見てから、その終値で売買できないようにするため）。\n"
+            f"注文番号 {placed.order_id} ・ 取り消しは `/orders`"
+        ),
+        color=discord.Color.light_grey(),
+    )
+
+
+def buy_embed(r: portfolio.BuyResult, price_note: str = "約 20 分遅れの最新株価") -> discord.Embed:
     embed = discord.Embed(
         title=f"💰 {r.company_name} ({r.ticker}) を仮想購入しました",
-        description=f"{shares:,} 株 × {r.price:,.1f} 円（約 20 分遅れの最新株価）",
+        description=f"{r.shares:,} 株 × {r.price:,.1f} 円（{price_note}）",
         color=discord.Color.blue(),
     )
     for f in r.fills:
@@ -246,8 +261,9 @@ def sell_embed(r: portfolio.SellResult) -> discord.Embed:
 
 def portfolio_embed(s: portfolio.Summary) -> discord.Embed:
     color = discord.Color.green() if s.total_return >= 0 else discord.Color.red()
-    embed = discord.Embed(title="📊 仮想ポートフォリオ（新NISA＋特定口座）", color=color)
-    lines = [f"総資産 **{_yen(s.total_value)}**（元手 {_yen(portfolio.INITIAL_CASH)} から {s.total_return:+.2%}）"]
+    who = "🤖 AI の" if s.owner == "ai" else ""
+    embed = discord.Embed(title=f"📊 {who}仮想ポートフォリオ（新NISA＋特定口座）", color=color)
+    lines = [f"総資産 **{_yen(s.total_value)}**（入金額の合計 {_yen(s.deposits)} から {s.total_return:+.2%}）"]
     if s.topix_change is not None:
         diff = s.total_return - s.topix_change
         lines.append(f"同じ期間の TOPIX {s.topix_change:+.2%} → 市場平均に {diff:+.2%} の{'勝ち' if diff >= 0 else '負け'}")
@@ -268,10 +284,75 @@ def portfolio_embed(s: portfolio.Summary) -> discord.Embed:
             text.append(f"ほか {len(rows) - 15} 銘柄")
         embed.add_field(name=label, value="\n".join(text)[:1024], inline=False)
     if not s.holdings:
-        embed.add_field(name="保有", value="まだ保有していません。`/buy` や「💰 仮想で買う」ボタンで買えます。", inline=False)
+        empty = "まだ保有していません。" + ("" if s.owner == "ai" else "`/buy` や「💰 仮想で買う」ボタンで買えます。")
+        embed.add_field(name="保有", value=empty, inline=False)
     embed.set_footer(
         text=f"今年の税金 {_yen(s.year_tax)} ・ 手数料 {_yen(s.year_fee)} ・ {s.started_at.astimezone(JST):%Y/%m/%d} 開始 ・ 株価は約 20 分遅れ"
     )
+    return embed
+
+
+def fills_embed(executed: list[orders.Executed], owner: str) -> discord.Embed:
+    """取引時間外に出した注文の約定結果をまとめる。"""
+    embed = discord.Embed(title="📝 注文が約定しました（今日の始値）", color=discord.Color.blue())
+    lines = []
+    for e in executed:
+        o = e.order
+        action = "買い" if o["side"] == "buy" else "売り"
+        if e.result is None:
+            lines.append(f"⚠️ {action}: {o['company_name']} ({o['ticker']}) — 約定できませんでした（{e.error}）")
+        elif isinstance(e.result, portfolio.BuyResult):
+            lines.append(f"🟢 買い: {o['company_name']} ({o['ticker']}) {e.result.shares:,} 株 × {e.result.price:,.1f} 円")
+        else:
+            r = e.result
+            lines.append(
+                f"🔴 売り: {o['company_name']} ({o['ticker']}) {r.shares:,} 株 × {r.price:,.1f} 円"
+                f"（損益 {_yen(r.net, sign=True)} / {r.return_rate:+.1%}）"
+            )
+    embed.description = "\n".join(lines)
+    return embed
+
+
+class _CancelOrderSelect(discord.ui.Select):
+    def __init__(self, open_orders: list[dict]) -> None:
+        super().__init__(
+            placeholder="取り消す注文を選択",
+            options=[
+                discord.SelectOption(label=order_label(o)[:100], value=str(o["id"])) for o in open_orders[:25]
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        ok = await orders.cancel(int(self.values[0]))
+        remaining = await db.vp_orders("open", "you")
+        text = "🗑️ 注文を取り消しました。" if ok else "その注文はすでに約定済みか、取り消し済みです。"
+        await interaction.response.edit_message(content=text, embed=orders_embed(remaining), view=OrdersView(remaining))
+
+
+class OrdersView(discord.ui.View):
+    def __init__(self, open_orders: list[dict]) -> None:
+        super().__init__(timeout=600)
+        if open_orders:
+            self.add_item(_CancelOrderSelect(open_orders))
+
+
+def order_label(o: dict) -> str:
+    if o["side"] == "buy":
+        what = f"買い {o['amount']:,.0f} 円分"
+    else:
+        what = "売り " + (f"{o['shares']:,} 株" if o["shares"] else "全株")
+    return f"#{o['id']} {o['ticker']} {o['company_name']} {what}"
+
+
+def orders_embed(open_orders: list[dict]) -> discord.Embed:
+    embed = discord.Embed(title=f"📝 未約定の注文 ({len(open_orders)})", color=discord.Color.light_grey())
+    if not open_orders:
+        embed.description = "未約定の注文はありません。"
+        return embed
+    embed.description = "\n".join(
+        f"{order_label(o)}（{o['created_at'].astimezone(JST):%m/%d %H:%M} 受付）" for o in open_orders[:25]
+    )
+    embed.set_footer(text="翌取引日の始値で約定します")
     return embed
 
 

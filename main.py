@@ -29,11 +29,15 @@ import signals
 import views
 from jev_client import JevJudge
 from market import JST
+from relations import RelationGraph
 from ticker_master import TickerMaster
 
 log = logging.getLogger("bot")
 
 MAX_PROPOSALS_PER_RUN = 10
+RELATED_PER_ORIGIN = 3
+MAX_RELATED_CANDIDATES = 30
+MAX_RELATED_PROPOSALS_PER_RUN = 5
 MAX_JEV_CANDIDATES = 150
 JEV_CONCURRENCY = 5
 PROPOSAL_DEDUP_DAYS = 3
@@ -79,11 +83,13 @@ class StockBot(ext_commands.Bot):
     def __init__(self) -> None:
         super().__init__(command_prefix=ext_commands.when_mentioned, intents=discord.Intents.default())
         self.master = TickerMaster()
+        self.relations = RelationGraph()
         self.jev: JevJudge | None = None
         self._health_runner: web.AppRunner | None = None
         self._proposal_lock = asyncio.Lock()
         self._signal_lock = asyncio.Lock()
         self._master_lock = asyncio.Lock()
+        self._relations_lock = asyncio.Lock()
         self._background: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------ 起動・終了
@@ -155,6 +161,10 @@ class StockBot(ext_commands.Bot):
         if self.master.is_stale() and not self._master_lock.locked():
             self._spawn(self._guarded(self._master_lock, self.refresh_master))
 
+        # 関係データは起動直後（DB キャッシュからの読み込み）と、7 日ごとの再取得をここで行う
+        if self.relations.is_stale() and not self._relations_lock.locked():
+            self._spawn(self._guarded(self._relations_lock, self.relations.load))
+
     @tick.before_loop
     async def _before_tick(self) -> None:
         await self.wait_until_ready()
@@ -217,48 +227,97 @@ class StockBot(ext_commands.Bot):
         candidates = candidates[:MAX_JEV_CANDIDATES]
         log.info("Jev 判定対象: %d 件", len(candidates))
 
-        semaphore = asyncio.Semaphore(JEV_CONCURRENCY)
-
-        async def judge(item, info):
-            async with semaphore:
-                try:
-                    return item, info, await self.jev.judge(item.title, item.summary, info.name)
-                except Exception:
-                    log.warning("Jev 判定に失敗: %s", item.title, exc_info=True)
-                    return None
-
-        results = [r for r in await asyncio.gather(*(judge(i, s) for i, s in candidates)) if r]
         min_positive = float(settings["jev_positive_threshold"])
         min_impact = float(settings["jev_impact_threshold"])
-        passed = [r for r in results if r[2].is_positive >= min_positive and r[2].impact >= min_impact]
-        passed.sort(key=lambda r: (r[2].impact, r[2].is_positive), reverse=True)
+        results = await self._judge_all([(item, info, None) for item, info in candidates])
+        passed = [r for r in results if r[-1].is_positive >= min_positive and r[-1].impact >= min_impact]
+        passed.sort(key=lambda r: (r[-1].impact, r[-1].is_positive), reverse=True)
         log.info("Jev 判定通過: %d / %d 件", len(passed), len(results))
 
+        # 関連銘柄への波及: 通過した銘柄の取引先・提携先などについて、同じニュースで改めて判定する
+        passed_count = len(passed)
+        passed = passed[:MAX_PROPOSALS_PER_RUN]  # 投稿しない銘柄の関連銘柄だけが届かないよう、先に絞る
+        related = []
+        for item, origin, _, _ in passed:
+            added = 0
+            for rel in self.relations.neighbors(origin.code, origin.name):
+                target = self.master.get(rel.code)
+                if target is None or target.code in skip:
+                    continue  # 監視中・提案済みなどで除外したぶんは、次の候補で埋める
+                skip.add(target.code)
+                relation = f"{target.name}は{origin.name}の{rel.label}"
+                related.append((item, target, (origin, relation)))
+                added += 1
+                if added == RELATED_PER_ORIGIN:
+                    break
+        related = related[:MAX_RELATED_CANDIDATES]
+        related_results = await self._judge_all(related)
+        related_passed = [
+            r for r in related_results if r[-1].is_positive >= min_positive and r[-1].impact >= min_impact
+        ]
+        related_passed.sort(key=lambda r: (r[-1].impact, r[-1].is_positive), reverse=True)
+        log.info("関連銘柄の Jev 判定通過: %d / %d 件", len(related_passed), len(related_results))
+
         channel = await self._channel("DISCORD_CHANNEL_PROPOSAL")
+        posted = await self._post_proposals(channel, passed)
+        related_posted = await self._post_proposals(channel, related_passed[:MAX_RELATED_PROPOSALS_PER_RUN])
+        return {
+            "news": len(items),
+            "candidates": len(candidates),
+            "judged": len(results),
+            "passed": passed_count,
+            "posted": posted,
+            "related_candidates": len(related),
+            "related_passed": len(related_passed),
+            "related_posted": related_posted,
+        }
+
+    async def _judge_all(self, targets: list[tuple]) -> list[tuple]:
+        """(記事, 銘柄, 関連情報 or None) の組をまとめて Jev で判定し、成功したものに判定結果を付けて返す。"""
+        semaphore = asyncio.Semaphore(JEV_CONCURRENCY)
+
+        async def judge(item, info, ctx):
+            async with semaphore:
+                try:
+                    relation = ctx[1] if ctx else None
+                    return item, info, ctx, await self.jev.judge(item.title, item.summary, info.name, relation)
+                except Exception:
+                    log.warning("Jev 判定に失敗: %s / %s", info.name, item.title, exc_info=True)
+                    return None
+
+        return [r for r in await asyncio.gather(*(judge(*t) for t in targets)) if r]
+
+    async def _post_proposals(self, channel, results: list[tuple]) -> int:
         posted = 0
-        for item, info, judgement in passed[:MAX_PROPOSALS_PER_RUN]:
+        for item, info, ctx, judgement in results:
             pending_id = await db.add_pending(
                 info.code, info.name, item.title, item.url, judgement.is_positive, judgement.impact
             )
             if pending_id is None:
                 continue
             posted += 1
-            embed = discord.Embed(
-                title=f"📰 {info.name} ({info.code})",
-                description=f"[{item.title}]({item.url})" + (f"\n— {item.source}" if item.source else ""),
-                color=discord.Color.gold(),
-            )
+            source = f"\n— {item.source}" if item.source else ""
+            if ctx is None:
+                embed = discord.Embed(
+                    title=f"📰 {info.name} ({info.code})",
+                    description=f"[{item.title}]({item.url}){source}",
+                    color=discord.Color.gold(),
+                )
+            else:
+                origin, relation = ctx
+                embed = discord.Embed(
+                    title=f"🔗 関連銘柄: {info.name} ({info.code})",
+                    description=f"{origin.name} ({origin.code}) のニュースの関連銘柄です。\n[{item.title}]({item.url}){source}",
+                    color=discord.Color.teal(),
+                )
+                embed.add_field(name="関係", value=relation, inline=False)
             embed.add_field(name="プラス材料の確率", value=f"{judgement.is_positive:.0%}")
             embed.add_field(name="インパクト", value=f"{judgement.impact:.2f} / 2")
             embed.add_field(name="市場・業種", value=f"{info.market}\n{info.sector}")
+            if ctx is not None:
+                embed.set_footer(text="関係データ: JP Market Vis（EDINET 等から自動抽出。誤りを含む場合があります）")
             await channel.send(embed=embed, view=views.proposal_view(pending_id, info.code))
-        return {
-            "news": len(items),
-            "candidates": len(candidates),
-            "judged": len(results),
-            "passed": len(passed),
-            "posted": posted,
-        }
+        return posted
 
     # ------------------------------------------------------------ モジュール3: 売買シグナル
 

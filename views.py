@@ -7,7 +7,6 @@ Bot の再起動後も過去のメッセージのボタンが押せるように�
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 import discord
@@ -31,17 +30,17 @@ SIGNAL_OPTIONS = [
 SOURCE_LABELS = {"proposal": "提案から", "manual": "手動"}
 
 
+# 上場企業同士の関係図。銘柄ページを直接開く URL はないので、トップページを開く
+JP_MARKET_VIS_URL = "https://mattyamonaca.github.io/JP_Market_Vis/"
+
+
 def external_links(code: str) -> list[tuple[str, str]]:
-    links = []
-    # JP Market Vis の URL 形式は公開情報で確認できないため、テンプレートを環境変数で指定する（例: https://.../{code}）
-    if template := os.getenv("JPMV_URL_TEMPLATE"):
-        links.append(("JP Market Vis", template.format(code=code)))
-    links += [
+    return [
+        ("JP Market Vis", JP_MARKET_VIS_URL),
         ("株探", f"https://kabutan.jp/stock/?code={code}"),
         ("Yahoo!ファイナンス", f"https://finance.yahoo.co.jp/quote/{code}.T"),
         ("四季報", f"https://shikiho.toyokeizai.net/stocks/{code}"),
     ]
-    return links
 
 
 def link_view(code: str) -> discord.ui.View:

@@ -57,12 +57,20 @@ CREATE TABLE IF NOT EXISTS ticker_master (
     sector     TEXT,
     fetched_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS company_relations (
+    source        TEXT NOT NULL,
+    target        TEXT NOT NULL,
+    relation_type TEXT NOT NULL,
+    fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (source, target, relation_type)
+);
 -- テーブルを REST API などで外部公開するサービスでも第三者に読み書きされないよう、RLS を有効化しておく。
 -- (Bot はテーブル所有者のロールで接続するので RLS の影響を受けない)
 ALTER TABLE pending_stocks   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE monitored_stocks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE user_settings    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ticker_master    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE company_relations ENABLE ROW LEVEL SECURITY;
 """
 
 _pool: AsyncConnectionPool | None = None
@@ -234,3 +242,30 @@ async def replace_ticker_master(rows: list[dict[str, Any]]) -> datetime:
 
 def is_stale(fetched_at: datetime | None, days: int = 7) -> bool:
     return fetched_at is None or datetime.now(timezone.utc) - fetched_at > timedelta(days=days)
+
+
+# ---------------------------------------------------------------- company_relations
+
+
+async def load_relations() -> tuple[list[dict[str, Any]], datetime | None]:
+    """キャッシュ済みの関係データと、その取得日時を返す。"""
+    async with _pool_or_raise().connection() as conn:
+        rows = await (
+            await conn.execute("SELECT source, target, relation_type, fetched_at FROM company_relations")
+        ).fetchall()
+    fetched_at = min((r["fetched_at"] for r in rows), default=None)
+    return rows, fetched_at
+
+
+async def replace_relations(rows: list[dict[str, Any]]) -> datetime:
+    """関係データをまるごと入れ替え、取得日時を返す。"""
+    now = datetime.now(timezone.utc)
+    async with _pool_or_raise().connection() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM company_relations")
+            async with conn.cursor() as cur:
+                await cur.executemany(
+                    "INSERT INTO company_relations (source, target, relation_type, fetched_at) VALUES (%s, %s, %s, %s)",
+                    [(r["source"], r["target"], r["relation_type"], now) for r in rows],
+                )
+    return now

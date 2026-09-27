@@ -109,9 +109,11 @@ class TestGroup(
         text = (
             f"✅ 提案ジョブを実行しました\n"
             f"ニュース {stats['news']} 件 → 銘柄が見つかった候補 {stats['candidates']} 件 → "
-            f"Jev 判定 {stats['judged']} 件 → しきい値通過 {stats['passed']} 件 → 投稿 {stats['posted']} 件"
+            f"Jev 判定 {stats['judged']} 件 → しきい値通過 {stats['passed']} 件 → 投稿 {stats['posted']} 件\n"
+            f"関連銘柄: 候補 {stats['related_candidates']} 件 → しきい値通過 {stats['related_passed']} 件 → "
+            f"投稿 {stats['related_posted']} 件"
         )
-        if stats["posted"] == 0:
+        if stats["posted"] + stats["related_posted"] == 0:
             text += "\n（直近 3 日以内に提案済み・監視中の銘柄は除外しています）"
         await interaction.followup.send(text, ephemeral=True)
 

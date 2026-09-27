@@ -38,10 +38,13 @@ class JevJudge:
             timeout=15.0,
         )
 
-    async def judge(self, title: str, summary: str, company: str) -> Judgement:
+    async def judge(self, title: str, summary: str, company: str, relation: str | None = None) -> Judgement:
+        """relation を渡すと、ニュースの当事者ではない関連企業として判定する（例: 「○○は△△の主要販売先」）。"""
         state = f"対象企業: {company}\nニュース見出し: {title}"
         if summary and summary != title:
             state += f"\n概要: {summary}"
+        if relation:
+            state += f"\n対象企業とニュースの関係: {relation}"
         result = await self._client.system_one(
             state=state,
             questions={

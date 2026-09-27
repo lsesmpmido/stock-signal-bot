@@ -1,0 +1,236 @@
+"""PostgreSQL 接続・テーブル自動作成・データアクセス。
+
+DATABASE_URL の接続文字列で psycopg から接続し、テーブルは起動時に自動で作成する。
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+from psycopg_pool import AsyncConnectionPool
+
+log = logging.getLogger(__name__)
+
+DEFAULT_SETTINGS: dict[str, str] = {
+    "proposal_freq": "twice",  # twice / once / off
+    "signal_freq": "1h",  # 15m / 1h / close / off
+    "jev_positive_threshold": "0.7",
+    "jev_impact_threshold": "1.0",
+}
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS pending_stocks (
+    id           BIGSERIAL PRIMARY KEY,
+    ticker       TEXT NOT NULL,
+    company_name TEXT NOT NULL,
+    news_title   TEXT NOT NULL,
+    news_url     TEXT NOT NULL,
+    score        DOUBLE PRECISION,
+    impact       DOUBLE PRECISION,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (ticker, news_url)
+);
+CREATE TABLE IF NOT EXISTS monitored_stocks (
+    ticker           TEXT PRIMARY KEY,
+    company_name     TEXT NOT NULL,
+    source           TEXT NOT NULL DEFAULT 'manual',
+    added_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_notified_at TIMESTAMPTZ,
+    last_signal      TEXT,
+    signal_state     JSONB
+);
+CREATE TABLE IF NOT EXISTS user_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ticker_master (
+    code       TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    market     TEXT,
+    sector     TEXT,
+    fetched_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- テーブルを REST API などで外部公開するサービスでも第三者に読み書きされないよう、RLS を有効化しておく。
+-- (Bot はテーブル所有者のロールで接続するので RLS の影響を受けない)
+ALTER TABLE pending_stocks   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE monitored_stocks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_settings    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ticker_master    ENABLE ROW LEVEL SECURITY;
+"""
+
+_pool: AsyncConnectionPool | None = None
+
+
+def _pool_or_raise() -> AsyncConnectionPool:
+    if _pool is None:
+        raise RuntimeError("db.init() が呼ばれていません")
+    return _pool
+
+
+async def init() -> None:
+    """接続プールを開き、テーブルを自動作成して設定の既定値を投入する。"""
+    global _pool
+    params = conninfo_to_dict(os.environ["DATABASE_URL"])
+    params.setdefault("sslmode", "prefer")  # SSL が使えれば使う（ローカルの SSL なし PostgreSQL にもつながる）
+    _pool = AsyncConnectionPool(
+        make_conninfo(**params),
+        min_size=1,
+        max_size=4,
+        # トランザクションモードのコネクションプーラー経由でも動くよう、プリペアドステートメントを使わない
+        kwargs={"autocommit": True, "prepare_threshold": None, "row_factory": dict_row},
+        check=AsyncConnectionPool.check_connection,
+        open=False,
+    )
+    await _pool.open(wait=True, timeout=30)
+    async with _pool.connection() as conn:
+        await conn.execute(SCHEMA_SQL)
+        for key, value in DEFAULT_SETTINGS.items():
+            await conn.execute(
+                "INSERT INTO user_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING",
+                (key, value),
+            )
+    log.info("DB 初期化完了")
+
+
+async def close() -> None:
+    if _pool is not None:
+        await _pool.close()
+
+
+# ---------------------------------------------------------------- user_settings
+
+
+async def get_all_settings() -> dict[str, str]:
+    async with _pool_or_raise().connection() as conn:
+        rows = await (await conn.execute("SELECT key, value FROM user_settings")).fetchall()
+    return {**DEFAULT_SETTINGS, **{r["key"]: r["value"] for r in rows}}
+
+
+async def set_setting(key: str, value: str) -> None:
+    async with _pool_or_raise().connection() as conn:
+        await conn.execute(
+            "INSERT INTO user_settings (key, value) VALUES (%s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            (key, value),
+        )
+
+
+# ---------------------------------------------------------------- pending_stocks
+
+
+async def recently_proposed_tickers(days: int = 3) -> set[str]:
+    """直近 days 日以内に提案済み（承認・スキップ含む）の銘柄。重複提案の抑止に使う。"""
+    async with _pool_or_raise().connection() as conn:
+        rows = await (
+            await conn.execute(
+                "SELECT DISTINCT ticker FROM pending_stocks WHERE created_at > now() - make_interval(days => %s)",
+                (days,),
+            )
+        ).fetchall()
+    return {r["ticker"] for r in rows}
+
+
+async def add_pending(
+    ticker: str, company_name: str, news_title: str, news_url: str, score: float, impact: float
+) -> int | None:
+    """提案を保存して id を返す。同じ銘柄×同じ記事が既にあれば None。"""
+    async with _pool_or_raise().connection() as conn:
+        row = await (
+            await conn.execute(
+                "INSERT INTO pending_stocks (ticker, company_name, news_title, news_url, score, impact) "
+                "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (ticker, news_url) DO NOTHING RETURNING id",
+                (ticker, company_name, news_title, news_url, score, impact),
+            )
+        ).fetchone()
+    return row["id"] if row else None
+
+
+async def get_pending(pending_id: int) -> dict[str, Any] | None:
+    async with _pool_or_raise().connection() as conn:
+        return await (await conn.execute("SELECT * FROM pending_stocks WHERE id = %s", (pending_id,))).fetchone()
+
+
+async def set_pending_status(pending_id: int, status: str) -> None:
+    async with _pool_or_raise().connection() as conn:
+        await conn.execute("UPDATE pending_stocks SET status = %s WHERE id = %s", (status, pending_id))
+
+
+# ---------------------------------------------------------------- monitored_stocks
+
+
+async def add_monitored(ticker: str, company_name: str, source: str) -> bool:
+    """監視対象に追加。既に登録済みなら False。"""
+    async with _pool_or_raise().connection() as conn:
+        row = await (
+            await conn.execute(
+                "INSERT INTO monitored_stocks (ticker, company_name, source) VALUES (%s, %s, %s) "
+                "ON CONFLICT (ticker) DO NOTHING RETURNING ticker",
+                (ticker, company_name, source),
+            )
+        ).fetchone()
+    return row is not None
+
+
+async def remove_monitored(ticker: str) -> dict[str, Any] | None:
+    """監視解除。解除した行を返す（未登録なら None）。"""
+    async with _pool_or_raise().connection() as conn:
+        return await (
+            await conn.execute("DELETE FROM monitored_stocks WHERE ticker = %s RETURNING *", (ticker,))
+        ).fetchone()
+
+
+async def list_monitored() -> list[dict[str, Any]]:
+    async with _pool_or_raise().connection() as conn:
+        return await (await conn.execute("SELECT * FROM monitored_stocks ORDER BY added_at")).fetchall()
+
+
+async def save_signal_state(ticker: str, signal_state: dict[str, Any], last_signal: str | None = None) -> None:
+    """シグナル判定の状態を保存。last_signal を渡したときは通知したものとして通知日時も更新する。"""
+    async with _pool_or_raise().connection() as conn:
+        if last_signal is None:
+            await conn.execute(
+                "UPDATE monitored_stocks SET signal_state = %s WHERE ticker = %s",
+                (Jsonb(signal_state), ticker),
+            )
+        else:
+            await conn.execute(
+                "UPDATE monitored_stocks SET signal_state = %s, last_signal = %s, last_notified_at = now() "
+                "WHERE ticker = %s",
+                (Jsonb(signal_state), last_signal, ticker),
+            )
+
+
+# ---------------------------------------------------------------- ticker_master
+
+
+async def load_ticker_master() -> tuple[list[dict[str, Any]], datetime | None]:
+    """キャッシュ済みの銘柄一覧と、その取得日時を返す。"""
+    async with _pool_or_raise().connection() as conn:
+        rows = await (await conn.execute("SELECT code, name, market, sector, fetched_at FROM ticker_master")).fetchall()
+    fetched_at = min((r["fetched_at"] for r in rows), default=None)
+    return rows, fetched_at
+
+
+async def replace_ticker_master(rows: list[dict[str, Any]]) -> datetime:
+    """銘柄一覧をまるごと入れ替え、取得日時を返す。"""
+    now = datetime.now(timezone.utc)
+    async with _pool_or_raise().connection() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM ticker_master")
+            async with conn.cursor() as cur:
+                await cur.executemany(
+                    "INSERT INTO ticker_master (code, name, market, sector, fetched_at) VALUES (%s, %s, %s, %s, %s)",
+                    [(r["code"], r["name"], r["market"], r["sector"], now) for r in rows],
+                )
+    return now
+
+
+def is_stale(fetched_at: datetime | None, days: int = 7) -> bool:
+    return fetched_at is None or datetime.now(timezone.utc) - fetched_at > timedelta(days=days)

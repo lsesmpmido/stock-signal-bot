@@ -1,0 +1,16 @@
+discord.py>=2.4,<3
+aiohttp>=3.9
+python-dotenv>=1.0
+psycopg[binary]>=3.2
+psycopg-pool>=3.2
+feedparser>=6.0
+typesafe-sdk>=0.7.2
+yfinance>=0.2.54
+pandas>=2.2
+numpy>=1.26
+ta>=0.11
+mplfinance>=0.12.10b0
+matplotlib>=3.8
+matplotlib-fontja>=1.0
+openpyxl>=3.1
+jpholiday>=0.1.10

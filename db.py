@@ -22,6 +22,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "signal_freq": "1h",  # 15m / 1h / close / off
     "jev_positive_threshold": "0.7",
     "jev_impact_threshold": "1.0",
+    # 仮想売買
+    "vp_cash": "2400000",  # 現金残高（円）。元手は新NISA 成長投資枠の年間上限と同じ 240 万円
+    "vp_fee_rate": "0",  # 売買手数料（売買代金に対する割合。例: 0.0022 = 0.22%）
+    "vp_default_amount": "200000",  # 金額を省略したときの購入額（円）
 }
 
 SCHEMA_SQL = """
@@ -64,6 +68,29 @@ CREATE TABLE IF NOT EXISTS company_relations (
     fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (source, target, relation_type)
 );
+CREATE TABLE IF NOT EXISTS vp_positions (
+    account      TEXT NOT NULL,  -- 'nisa' / 'tokutei'
+    ticker       TEXT NOT NULL,
+    company_name TEXT NOT NULL,
+    shares       INTEGER NOT NULL,
+    cost         DOUBLE PRECISION NOT NULL,  -- 取得費の合計（購入代金＋手数料）
+    opened_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (account, ticker)
+);
+CREATE TABLE IF NOT EXISTS vp_trades (
+    id           BIGSERIAL PRIMARY KEY,
+    account      TEXT NOT NULL,
+    ticker       TEXT NOT NULL,
+    company_name TEXT NOT NULL,
+    side         TEXT NOT NULL,  -- 'buy' / 'sell'
+    shares       INTEGER NOT NULL,
+    price        DOUBLE PRECISION NOT NULL,
+    amount       DOUBLE PRECISION NOT NULL,  -- 売買代金（株価×株数）
+    fee          DOUBLE PRECISION NOT NULL DEFAULT 0,
+    realized     DOUBLE PRECISION,  -- 売却時の損益（税引前、手数料込み）
+    tax          DOUBLE PRECISION NOT NULL DEFAULT 0,  -- 源泉徴収額（マイナスは還付）
+    traded_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS price_daily (
     ticker TEXT NOT NULL,
     date   DATE NOT NULL,
@@ -82,6 +109,8 @@ ALTER TABLE user_settings    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ticker_master    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE company_relations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE price_daily      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vp_positions     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vp_trades        ENABLE ROW LEVEL SECURITY;
 """
 
 _pool: AsyncConnectionPool | None = None
@@ -110,7 +139,7 @@ async def init() -> None:
     await _pool.open(wait=True, timeout=30)
     async with _pool.connection() as conn:
         await conn.execute(SCHEMA_SQL)
-        for key, value in DEFAULT_SETTINGS.items():
+        for key, value in {**DEFAULT_SETTINGS, "vp_started_at": datetime.now(timezone.utc).isoformat()}.items():
             await conn.execute(
                 "INSERT INTO user_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING",
                 (key, value),
@@ -341,3 +370,63 @@ async def prune_prices(before: date) -> int:
     async with _pool_or_raise().connection() as conn:
         cur = await conn.execute("DELETE FROM price_daily WHERE date < %s", (before,))
         return cur.rowcount
+
+
+# ---------------------------------------------------------------- 仮想売買（vp_positions / vp_trades）
+
+
+async def vp_positions(ticker: str | None = None) -> list[dict[str, Any]]:
+    async with _pool_or_raise().connection() as conn:
+        if ticker is None:
+            sql, params = "SELECT * FROM vp_positions ORDER BY opened_at", ()
+        else:
+            sql, params = "SELECT * FROM vp_positions WHERE ticker = %s ORDER BY account", (ticker,)
+        return await (await conn.execute(sql, params)).fetchall()
+
+
+async def vp_year_totals(year_start: datetime) -> dict[str, float]:
+    """year_start 以降の、NISA の購入額合計・特定口座の実現損益合計・税金合計・手数料合計。"""
+    async with _pool_or_raise().connection() as conn:
+        row = await (
+            await conn.execute(
+                "SELECT "
+                "COALESCE(SUM(amount) FILTER (WHERE account = 'nisa' AND side = 'buy'), 0) AS nisa_bought, "
+                "COALESCE(SUM(realized) FILTER (WHERE account = 'tokutei' AND side = 'sell'), 0) AS tokutei_realized, "
+                "COALESCE(SUM(tax), 0) AS tax, COALESCE(SUM(fee), 0) AS fee "
+                "FROM vp_trades WHERE traded_at >= %s",
+                (year_start,),
+            )
+        ).fetchone()
+    return {k: float(v) for k, v in row.items()}
+
+
+async def vp_record_trade(
+    trade: dict[str, Any], cash_delta: float, position: dict[str, Any] | None, delete_position: bool = False
+) -> None:
+    """売買 1 件を記録し、現金残高と保有を更新する（すべて 1 つのトランザクションで行う）。
+
+    position: 更新後の保有（account, ticker, company_name, shares, cost）。delete_position=True なら保有を削除する。
+    """
+    async with _pool_or_raise().connection() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO vp_trades (account, ticker, company_name, side, shares, price, amount, fee, realized, tax) "
+                "VALUES (%(account)s, %(ticker)s, %(company_name)s, %(side)s, %(shares)s, %(price)s, %(amount)s, "
+                "%(fee)s, %(realized)s, %(tax)s)",
+                {"realized": None, "tax": 0, **trade},
+            )
+            await conn.execute(
+                "UPDATE user_settings SET value = (value::double precision + %s)::text WHERE key = 'vp_cash'",
+                (cash_delta,),
+            )
+            if delete_position:
+                await conn.execute(
+                    "DELETE FROM vp_positions WHERE account = %s AND ticker = %s", (trade["account"], trade["ticker"])
+                )
+            elif position is not None:
+                await conn.execute(
+                    "INSERT INTO vp_positions (account, ticker, company_name, shares, cost) "
+                    "VALUES (%(account)s, %(ticker)s, %(company_name)s, %(shares)s, %(cost)s) "
+                    "ON CONFLICT (account, ticker) DO UPDATE SET shares = EXCLUDED.shares, cost = EXCLUDED.cost",
+                    position,
+                )

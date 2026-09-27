@@ -1,4 +1,4 @@
-"""スラッシュコマンド: /settings, /watch add|remove|list, /test proposal|signal"""
+"""スラッシュコマンド: /settings, /watch add|remove|list, /buy, /sell, /portfolio, /test proposal|signal"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from discord import app_commands
 
 import db
 import market
+import portfolio
 import views
 from ticker_master import CODE_PATTERN, normalize_code
 
@@ -150,7 +151,85 @@ class TestGroup(
         await interaction.followup.send(f"✅ {name} ({code}) のテスト通知を送りました。", ephemeral=True)
 
 
+# ---------------------------------------------------------------- 仮想売買
+
+
+async def _held_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    current = current.strip()
+    seen = {}
+    for p in await db.vp_positions():
+        seen.setdefault(p["ticker"], p["company_name"])
+    return [
+        app_commands.Choice(name=f"{code} {name}"[:100], value=code)
+        for code, name in seen.items()
+        if current in code or current in name
+    ][:25]
+
+
+@app_commands.command(name="buy", description="仮想で買います（NISA の枠を優先し、超える分は特定口座）")
+@app_commands.describe(code="証券コード（例: 7203）", amount="購入金額（万円）。省略すると既定額（20 万円）")
+@app_commands.default_permissions(manage_guild=True)
+async def buy_command(interaction: discord.Interaction, code: str, amount: float | None = None) -> None:
+    code = normalize_code(code)
+    await interaction.response.defer(thinking=True)
+    try:
+        if not interaction.client.master.get(code) and not CODE_PATTERN.fullmatch(code):
+            raise portfolio.TradeError(f"`{code}` は証券コードの形式ではありません。")
+        name = await views.company_name(interaction.client, code)
+        yen = amount * 10_000 if amount is not None else await portfolio.default_amount()
+        if yen <= 0:
+            raise portfolio.TradeError("購入金額は 0 より大きくしてください。")
+        result = await portfolio.buy(code, name, yen)
+    except portfolio.TradeError as exc:
+        await interaction.followup.send(f"❌ {exc}")
+        return
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ 仮想購入でエラーが発生しました: `{exc}`")
+        raise
+    await interaction.followup.send(embed=views.buy_embed(result))
+
+
+@app_commands.command(name="sell", description="仮想で売ります（株数を省略すると全部、口座を省略すると特定口座から）")
+@app_commands.describe(code="証券コード", shares="売る株数（省略すると全部）", account="売る口座（省略すると特定口座から先に売る）")
+@app_commands.choices(
+    account=[app_commands.Choice(name=label, value=key) for key, label in portfolio.ACCOUNT_LABELS.items()]
+)
+@app_commands.autocomplete(code=_held_autocomplete)
+@app_commands.default_permissions(manage_guild=True)
+async def sell_command(
+    interaction: discord.Interaction,
+    code: str,
+    shares: app_commands.Range[int, 1] | None = None,
+    account: app_commands.Choice[str] | None = None,
+) -> None:
+    await interaction.response.defer(thinking=True)
+    try:
+        result = await portfolio.sell(normalize_code(code), shares, account.value if account else None)
+    except portfolio.TradeError as exc:
+        await interaction.followup.send(f"❌ {exc}")
+        return
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ 仮想売却でエラーが発生しました: `{exc}`")
+        raise
+    await interaction.followup.send(embed=views.sell_embed(result))
+
+
+@app_commands.command(name="portfolio", description="仮想ポートフォリオの保有・損益・NISA 枠の残りを表示します")
+@app_commands.default_permissions(manage_guild=True)
+async def portfolio_command(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=True)
+    try:
+        summary = await portfolio.summary()
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ ポートフォリオの取得でエラーが発生しました: `{exc}`")
+        raise
+    await interaction.followup.send(embed=views.portfolio_embed(summary))
+
+
 def setup(tree: app_commands.CommandTree) -> None:
     tree.add_command(settings_command)
     tree.add_command(WatchGroup())
     tree.add_command(TestGroup())
+    tree.add_command(buy_command)
+    tree.add_command(sell_command)
+    tree.add_command(portfolio_command)

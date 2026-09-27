@@ -110,7 +110,9 @@ class StockBot(ext_commands.Bot):
         await self.refresh_master()
         self.jev = JevJudge()
 
-        self.add_dynamic_items(views.AddPendingButton, views.SkipPendingButton, views.UnwatchButton)
+        self.add_dynamic_items(
+            views.AddPendingButton, views.SkipPendingButton, views.UnwatchButton, views.VirtualBuyButton
+        )
         commands.setup(self.tree)
         if guild_id := os.getenv("DISCORD_GUILD_ID"):
             guild = discord.Object(id=int(guild_id))

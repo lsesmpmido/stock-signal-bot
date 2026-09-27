@@ -12,6 +12,8 @@ from typing import Any
 import discord
 
 import db
+import market
+import portfolio
 from market import JST
 
 log = logging.getLogger(__name__)
@@ -54,12 +56,14 @@ def proposal_view(pending_id: int, code: str) -> discord.ui.View:
     view = link_view(code)
     view.add_item(AddPendingButton(pending_id))
     view.add_item(SkipPendingButton(pending_id))
+    view.add_item(VirtualBuyButton(code))
     return view
 
 
 def signal_view(code: str) -> discord.ui.View:
     view = link_view(code)
     view.add_item(UnwatchButton(code))
+    view.add_item(VirtualBuyButton(code))
     return view
 
 
@@ -149,6 +153,120 @@ class UnwatchButton(discord.ui.DynamicItem[discord.ui.Button], template=r"watch:
         else:
             msg = f"{self.code} はすでに監視対象ではありません。"
         await interaction.followup.send(msg, ephemeral=True)
+
+
+class VirtualBuyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"vp:buy:(?P<code>[0-9A-Z]+)"):
+    def __init__(self, code: str) -> None:
+        super().__init__(
+            discord.ui.Button(
+                label="💰 仮想で買う",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"vp:buy:{code}",
+                row=1,
+            )
+        )
+        self.code = code
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match) -> Any:
+        return cls(match["code"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            name = await company_name(interaction.client, self.code)
+            result = await portfolio.buy(self.code, name, await portfolio.default_amount())
+        except portfolio.TradeError as exc:
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+            return
+        except Exception as exc:
+            await interaction.followup.send(f"⚠️ 仮想購入でエラーが発生しました: `{exc}`", ephemeral=True)
+            raise
+        await interaction.followup.send(embed=buy_embed(result), ephemeral=True)
+
+
+# ---------------------------------------------------------------- 仮想売買の表示
+
+
+async def company_name(client, code: str) -> str:
+    if info := client.master.get(code):
+        return info.name
+    return await market.lookup_listed_name(code) or code
+
+
+def _yen(v: float, sign: bool = False) -> str:
+    return f"{v:+,.0f} 円" if sign else f"{v:,.0f} 円"
+
+
+def buy_embed(r: portfolio.BuyResult) -> discord.Embed:
+    shares = sum(f.shares for f in r.fills)
+    embed = discord.Embed(
+        title=f"💰 {r.company_name} ({r.ticker}) を仮想購入しました",
+        description=f"{shares:,} 株 × {r.price:,.1f} 円（約 20 分遅れの最新株価）",
+        color=discord.Color.blue(),
+    )
+    for f in r.fills:
+        fee = f"（手数料 {_yen(f.fee)}）" if f.fee else ""
+        embed.add_field(name=portfolio.ACCOUNT_LABELS[f.account], value=f"{f.shares:,} 株 / {_yen(f.amount)}{fee}")
+    embed.set_footer(text=f"現金残高 {_yen(r.cash_after)} ・ 今年の NISA 枠の残り {_yen(r.nisa_left)}")
+    return embed
+
+
+def sell_embed(r: portfolio.SellResult) -> discord.Embed:
+    color = discord.Color.green() if r.net >= 0 else discord.Color.red()
+    embed = discord.Embed(
+        title=f"🎓 {r.company_name} ({r.ticker}) を仮想売却しました",
+        description=f"{portfolio.ACCOUNT_LABELS[r.account]} ・ {r.shares:,} 株 × {r.price:,.1f} 円",
+        color=color,
+    )
+    embed.add_field(name="保有期間", value=f"{r.held_days} 日")
+    embed.add_field(name="損益", value=f"{_yen(r.net, sign=True)}（{r.return_rate:+.1%}）")
+    if r.topix_change is not None:
+        diff = r.return_rate - r.topix_change
+        verdict = "勝ち" if diff >= 0 else "負け"
+        embed.add_field(name="同じ期間の TOPIX", value=f"{r.topix_change:+.1%} → 市場平均に {diff:+.1%} の{verdict}")
+    details = [f"売却代金 {_yen(r.amount)}", f"取得費 {_yen(r.cost)}"]
+    if r.fee:
+        details.append(f"手数料 {_yen(r.fee)}")
+    if r.account == "tokutei":
+        details.append(f"税金 {_yen(r.tax)}" if r.tax >= 0 else f"税金の還付 {_yen(-r.tax)}")
+    else:
+        details.append("NISA のため非課税")
+    embed.add_field(name="内訳", value=" / ".join(details), inline=False)
+    embed.add_field(name="称号", value=portfolio.title_for(r), inline=False)
+    embed.set_footer(text=f"現金残高 {_yen(r.cash_after)}")
+    return embed
+
+
+def portfolio_embed(s: portfolio.Summary) -> discord.Embed:
+    color = discord.Color.green() if s.total_return >= 0 else discord.Color.red()
+    embed = discord.Embed(title="📊 仮想ポートフォリオ（新NISA＋特定口座）", color=color)
+    lines = [f"総資産 **{_yen(s.total_value)}**（元手 {_yen(portfolio.INITIAL_CASH)} から {s.total_return:+.2%}）"]
+    if s.topix_change is not None:
+        diff = s.total_return - s.topix_change
+        lines.append(f"同じ期間の TOPIX {s.topix_change:+.2%} → 市場平均に {diff:+.2%} の{'勝ち' if diff >= 0 else '負け'}")
+    lines.append(f"現金 {_yen(s.cash)} ・ 今年の NISA 枠の残り {_yen(s.nisa_left)}")
+    embed.description = "\n".join(lines)
+    for account, label in portfolio.ACCOUNT_LABELS.items():
+        rows = [h for h in s.holdings if h.account == account]
+        if not rows:
+            continue
+        text = []
+        for h in rows[:15]:
+            if h.value is None:
+                text.append(f"{h.ticker} {h.company_name} {h.shares:,} 株（株価を取得できません）")
+            else:
+                rate = h.unrealized / h.cost if h.cost else 0
+                text.append(f"{h.ticker} {h.company_name} {h.shares:,} 株 {_yen(h.value)}（{_yen(h.unrealized, sign=True)} / {rate:+.1%}）")
+        if len(rows) > 15:
+            text.append(f"ほか {len(rows) - 15} 銘柄")
+        embed.add_field(name=label, value="\n".join(text)[:1024], inline=False)
+    if not s.holdings:
+        embed.add_field(name="保有", value="まだ保有していません。`/buy` や「💰 仮想で買う」ボタンで買えます。", inline=False)
+    embed.set_footer(
+        text=f"今年の税金 {_yen(s.year_tax)} ・ 手数料 {_yen(s.year_fee)} ・ {s.started_at.astimezone(JST):%Y/%m/%d} 開始 ・ 株価は約 20 分遅れ"
+    )
+    return embed
 
 
 # ---------------------------------------------------------------- /settings

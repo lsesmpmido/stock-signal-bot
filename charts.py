@@ -164,3 +164,47 @@ def multi_timeframe_chart(
     fig.suptitle(f"{name} ({code})  マルチ時間軸", fontsize=13)
     fig.tight_layout()
     return _to_png(fig)
+
+
+def compare_chart(
+    a: tuple[str, str, pd.DataFrame], b: tuple[str, str, pd.DataFrame], period_label: str
+) -> io.BytesIO | None:
+    """2 銘柄の終値を、期間の初日を 100 にそろえて重ねる。a, b は (証券コード, 銘柄名, 日足)。
+    共通の日付が 2 日未満なら None。"""
+    (a_code, a_name, a_df), (b_code, b_name, b_df) = a, b
+    joined = pd.concat({"a": a_df["Close"], "b": b_df["Close"]}, axis=1).dropna()
+    if len(joined) < 2:
+        return None
+    indexed = joined / joined.iloc[0] * 100
+
+    with plt.rc_context({"font.family": FONT_FAMILY}):
+        fig, ax = plt.subplots(figsize=(11, 5.5))
+    fig.patch.set_facecolor(SURFACE)
+    ax.set_facecolor(SURFACE)
+    lines = (("a", a_code, a_name, MA_COLORS["MA25"]), ("b", b_code, b_name, MA_COLORS["MA75"]))
+    for col, code, name, color in lines:
+        series = indexed[col]
+        ax.plot(series.index, series.values, color=color, linewidth=2, label=f"{name} ({code})")
+        # 終点に最終値を直接書き込む（凡例と行き来しなくても読めるように）
+        ax.annotate(
+            f"{series.iloc[-1]:.1f}",
+            (series.index[-1], series.iloc[-1]),
+            xytext=(6, 0),
+            textcoords="offset points",
+            va="center",
+            color=TEXT,
+            fontsize=10,
+        )
+    ax.axhline(100, color=MUTED, linewidth=0.8, linestyle="--")
+    title = f"{a_name} ({a_code}) と {b_name} ({b_code}) の比較（{period_label}、初日 = 100）"
+    ax.set_title(title, color=TEXT, fontsize=12, fontfamily=FONT_FAMILY)
+    for label in ax.get_xticklabels() + ax.get_yticklabels():
+        label.set_fontfamily(FONT_FAMILY)
+    ax.grid(color=GRID, linewidth=0.8)
+    for spine in ax.spines.values():
+        spine.set_color(GRID)
+    ax.tick_params(colors=MUTED)
+    ax.legend(loc="upper left", frameon=False, prop={"family": FONT_FAMILY, "size": 10})
+    ax.margins(x=0.06)
+    fig.autofmt_xdate()
+    return _to_png(fig)

@@ -14,7 +14,6 @@ import os
 from datetime import datetime, time, timedelta
 
 import discord
-import pandas as pd
 from aiohttp import web
 from discord.ext import commands as ext_commands
 from discord.ext import tasks
@@ -545,7 +544,6 @@ class StockBot(ext_commands.Bot):
 
     @staticmethod
     def _signal_embed(code: str, name: str, ind, events: list[signals.Signal]) -> discord.Embed:
-        last, prev = ind.iloc[-1], ind.iloc[-2]
         sides = {e.side for e in events}
         if not events:
             title, color = "🧪 テスト通知（現在の状態）", discord.Color.light_grey()
@@ -555,18 +553,12 @@ class StockBot(ext_commands.Bot):
             title, color = "🔴 売りシグナル", discord.Color.red()
         else:
             title, color = "🟡 売買シグナル（買い・売り混在）", discord.Color.orange()
-        change = (last["Close"] / prev["Close"] - 1) * 100
         embed = discord.Embed(title=f"{title}: {name} ({code})", color=color)
         if events:
             embed.description = "\n".join(f"・{'買い' if e.side == 'BUY' else '売り'}: {e.label}" for e in events)
         else:
             embed.description = "シグナルの有無に関係なく送ったテストです。監視状態は変更していません。"
-        embed.add_field(name="終値", value=f"{last['Close']:,.1f} 円 ({change:+.2f}%)")
-        embed.add_field(name="RSI(14)", value=f"{last['RSI']:.1f}")
-        embed.add_field(name="MACD / シグナル", value=f"{last['MACD']:.2f} / {last['MACD_signal']:.2f}")
-        ma = " / ".join(f"{last[c]:,.0f}" if pd.notna(last[c]) else "—" for c in ("MA25", "MA75", "MA200"))
-        embed.add_field(name="移動平均 25 / 75 / 200", value=ma, inline=False)
-        embed.set_footer(text=f"日足ベース・データは約20分遅れ・{ind.index[-1]:%Y/%m/%d}")
+        views.add_indicator_fields(embed, ind)
         return embed
 
 

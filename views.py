@@ -9,6 +9,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import pandas as pd
+
 import discord
 
 import db
@@ -52,6 +54,18 @@ def external_links(code: str) -> list[tuple[str, str]]:
         ("Yahoo!ファイナンス", f"https://finance.yahoo.co.jp/quote/{code}.T"),
         ("四季報", f"https://shikiho.toyokeizai.net/stocks/{code}"),
     ]
+
+
+def add_indicator_fields(embed: discord.Embed, ind: pd.DataFrame) -> None:
+    """終値・RSI・MACD・移動平均の欄を追加する（シグナル通知と /chart で共通）。"""
+    last, prev = ind.iloc[-1], ind.iloc[-2]
+    change = (last["Close"] / prev["Close"] - 1) * 100
+    embed.add_field(name="終値", value=f"{last['Close']:,.1f} 円 ({change:+.2f}%)")
+    embed.add_field(name="RSI(14)", value=f"{last['RSI']:.1f}")
+    embed.add_field(name="MACD / シグナル", value=f"{last['MACD']:.2f} / {last['MACD_signal']:.2f}")
+    ma = " / ".join(f"{last[c]:,.0f}" if pd.notna(last[c]) else "—" for c in ("MA25", "MA75", "MA200"))
+    embed.add_field(name="移動平均 25 / 75 / 200", value=ma, inline=False)
+    embed.set_footer(text=f"日足ベース・データは約20分遅れ・{ind.index[-1]:%Y/%m/%d}")
 
 
 def link_view(code: str) -> discord.ui.View:
@@ -340,6 +354,58 @@ def ai_fills_embed(executed: list[orders.Executed], mode: ai_trader.Mode, now) -
                 f" ・ 保有 {r.held_days} 日{tax}\n　{detail}"
             )
     embed.description = "\n".join(lines)[:4000]
+    return embed
+
+
+# ---------------------------------------------------------------- 便利コマンド（/chart /ranking /related）
+
+
+def chart_embed(code: str, name: str, ind: pd.DataFrame) -> discord.Embed:
+    embed = discord.Embed(title=f"📈 {name} ({code})", color=discord.Color.blurple())
+    add_indicator_fields(embed, ind)
+    return embed
+
+
+def ranking_embed(title: str, moves: list, note: str) -> discord.Embed:
+    """moves は reports.Move のリスト（騰落率の高い順）。"""
+    embed = discord.Embed(title=title, color=discord.Color.blurple())
+    if not moves:
+        embed.description = "対象の銘柄がありません。`/watch add` や `/buy` で追加できます。"
+        return embed
+    medals = {0: "🥇", 1: "🥈", 2: "🥉"}
+    lines = [
+        f"{medals.get(i, f'{i + 1}.')} {m.name} ({m.ticker}) {m.close:,.1f} 円　**{m.change:+.2%}**"
+        for i, m in enumerate(moves[:20])
+    ]
+    if len(moves) > 20:
+        lines.append(f"ほか {len(moves) - 20} 銘柄")
+    embed.description = "\n".join(lines)
+    embed.set_footer(text=note)
+    return embed
+
+
+RELATION_GROUPS = {1: "主要取引先・親会社・子会社", 2: "資本関係・資本業務提携", 3: "業務提携・技術・共同研究", 4: "取引先・製品導入"}
+
+
+def related_embed(code: str, name: str, related: list, names: dict[str, str], watched: set, held: set) -> discord.Embed:
+    """related は relations.Related のリスト（影響の大きい順）。"""
+    embed = discord.Embed(title=f"🔗 {name} ({code}) の関連企業", color=discord.Color.teal())
+    if not related:
+        embed.description = "関係データに、この銘柄と上場企業との関係は見つかりませんでした。"
+        return embed
+    shown = related[:15]
+    for priority, group in RELATION_GROUPS.items():
+        rows = [r for r in shown if r.priority == priority]
+        if not rows:
+            continue
+        lines = []
+        for r in rows:
+            marks = ("👀" if r.code in watched else "") + ("💰" if r.code in held else "")
+            lines.append(f"・{names.get(r.code, r.code)} ({r.code}){marks}: {name}の{r.label}")
+        embed.add_field(name=group, value="\n".join(lines)[:1024], inline=False)
+    rest = len(related) - len(shown)
+    embed.description = f"{len(related)} 社（影響の大きい順に表示）" + (f"・ほか {rest} 社" if rest else "") + "\n👀 監視中　💰 仮想で保有中"
+    embed.set_footer(text="関係データ: JP Market Vis（EDINET 等から自動抽出。誤りを含む場合があります）")
     return embed
 
 

@@ -1,4 +1,4 @@
-"""スラッシュコマンド: /settings, /watch add|remove|list, /buy, /sell, /portfolio, /orders, /battle, /deposit, /review, /test proposal|signal|report"""
+"""スラッシュコマンド: /settings, /watch add|remove|list, /buy, /sell, /portfolio, /orders, /battle, /deposit, /chart, /ranking, /compare, /related, /review, /test proposal|signal|report"""
 
 from __future__ import annotations
 
@@ -8,11 +8,13 @@ import discord
 from discord import app_commands
 
 import battle
+import charts
 import db
 import market
 import orders
 import portfolio
 import reports
+import signals
 import review
 import views
 from ticker_master import CODE_PATTERN, normalize_code
@@ -295,6 +297,152 @@ async def deposit_command(interaction: discord.Interaction, amount: app_commands
     await interaction.response.send_message(f"✅ 次回（1 月 1 日）の追加入金を **{yen:,} 円** にしました。", ephemeral=True)
 
 
+# ---------------------------------------------------------------- 便利コマンド
+
+
+class CommandError(Exception):
+    """利用者に見せるエラー。"""
+
+
+async def _resolve(interaction: discord.Interaction, code: str) -> tuple[str, str]:
+    """証券コードを確かめて (証券コード, 銘柄名) を返す。"""
+    code = normalize_code(code)
+    if info := interaction.client.master.get(code):
+        return code, info.name
+    if not CODE_PATTERN.fullmatch(code):
+        raise CommandError(f"`{code}` は証券コードの形式ではありません。")
+    name = await market.lookup_listed_name(code)
+    if name is None:
+        raise CommandError(f"証券コード `{code}` の上場銘柄は見つかりませんでした。")
+    return code, name
+
+
+async def _daily(code: str, name: str, years: int = 2, min_bars: int = 80):
+    df = (await market.get_daily([code], years=years)).get(code)
+    if df is None or len(df) < min_bars:
+        raise CommandError(f"{name} ({code}) の株価データを十分に取得できませんでした。")
+    return df
+
+
+async def _run(interaction: discord.Interaction, private: bool, body) -> None:
+    """defer → body() → エラーを利用者に返す、の共通処理。body は followup.send に渡す引数の dict を返す。"""
+    await interaction.response.defer(ephemeral=private, thinking=True)
+    try:
+        kwargs = await body()
+    except CommandError as exc:
+        await interaction.followup.send(f"❌ {exc}", ephemeral=private)
+        return
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ エラーが発生しました: `{exc}`", ephemeral=private)
+        raise
+    await interaction.followup.send(ephemeral=private, **kwargs)
+
+
+PRIVATE_DESC = "自分だけに表示する（既定: チャンネルの全員に表示）"
+
+
+@app_commands.command(name="chart", description="チャート 2 枚（詳細テクニカル・マルチ時間軸）を表示します")
+@app_commands.describe(code="証券コード（例: 7203）", private=PRIVATE_DESC)
+@app_commands.default_permissions(manage_guild=True)
+async def chart_command(interaction: discord.Interaction, code: str, private: bool = False) -> None:
+    async def body():
+        c, name = await _resolve(interaction, code)
+        df = await _daily(c, name)
+        ind = signals.compute(df)
+        detail = await asyncio.to_thread(charts.detailed_chart, c, name, ind)
+        multi = await asyncio.to_thread(charts.multi_timeframe_chart, c, name, await market.fetch_intraday(c), df)
+        files = [discord.File(detail, filename=f"{c}_technical.png")]
+        if multi is not None:
+            files.append(discord.File(multi, filename=f"{c}_multi.png"))
+        return {"embed": views.chart_embed(c, name, ind), "files": files, "view": views.link_view(c)}
+
+    await _run(interaction, private, body)
+
+
+RANKING_PERIODS = {"day": (1, "今日"), "week": (5, "1週間"), "month": (20, "1か月")}
+
+
+@app_commands.command(name="ranking", description="監視銘柄と仮想保有銘柄の騰落ランキングを表示します")
+@app_commands.describe(period="期間（既定: 今日）", private=PRIVATE_DESC)
+@app_commands.choices(period=[app_commands.Choice(name=label, value=key) for key, (_, label) in RANKING_PERIODS.items()])
+@app_commands.default_permissions(manage_guild=True)
+async def ranking_command(
+    interaction: discord.Interaction, period: app_commands.Choice[str] | None = None, private: bool = False
+) -> None:
+    bars, label = RANKING_PERIODS[period.value if period else "day"]
+
+    async def body():
+        watch = await db.list_monitored()
+        held = await db.vp_positions("you")
+        names = {s["ticker"]: s["company_name"] for s in watch} | {p["ticker"]: p["company_name"] for p in held}
+        daily = await market.get_daily(list(names))
+
+        def change(df):
+            if df is None or len(df) <= bars:
+                return None
+            return float(df["Close"].iloc[-1] / df["Close"].iloc[-1 - bars] - 1)
+
+        moves = reports._moves(list(names), names, daily, change)
+        title = f"🏆 騰落ランキング（{label}）"
+        return {"embed": views.ranking_embed(title, moves, "監視銘柄と、あなたの仮想保有銘柄 ・ 株価は約 20 分遅れ")}
+
+    await _run(interaction, private, body)
+
+
+COMPARE_PERIODS = {"3m": (63, "3か月"), "6m": (126, "6か月"), "1y": (245, "1年"), "2y": (490, "2年")}
+
+
+@app_commands.command(name="compare", description="2 銘柄の値動きを、期間の初日を 100 にそろえて比べます")
+@app_commands.describe(code1="証券コード 1", code2="証券コード 2", period="期間（既定: 6か月）", private=PRIVATE_DESC)
+@app_commands.choices(period=[app_commands.Choice(name=label, value=key) for key, (_, label) in COMPARE_PERIODS.items()])
+@app_commands.default_permissions(manage_guild=True)
+async def compare_command(
+    interaction: discord.Interaction,
+    code1: str,
+    code2: str,
+    period: app_commands.Choice[str] | None = None,
+    private: bool = False,
+) -> None:
+    bars, label = COMPARE_PERIODS[period.value if period else "6m"]
+
+    async def body():
+        (c1, n1), (c2, n2) = await _resolve(interaction, code1), await _resolve(interaction, code2)
+        if c1 == c2:
+            raise CommandError("違う銘柄を 2 つ指定してください。")
+        d1, d2 = await _daily(c1, n1, min_bars=2), await _daily(c2, n2, min_bars=2)
+        png = await asyncio.to_thread(charts.compare_chart, (c1, n1, d1.tail(bars)), (c2, n2, d2.tail(bars)), label)
+        if png is None:
+            raise CommandError("2 銘柄に共通する取引日のデータが足りません。")
+        r1, r2 = (float(d.tail(bars)["Close"].iloc[-1] / d.tail(bars)["Close"].iloc[0] - 1) for d in (d1, d2))
+        embed = discord.Embed(
+            title=f"⚖️ {n1} ({c1}) vs {n2} ({c2})（{label}）",
+            description=f"{n1}: **{r1:+.2%}**\n{n2}: **{r2:+.2%}**",
+            color=discord.Color.blurple(),
+        )
+        embed.set_image(url="attachment://compare.png")
+        return {"embed": embed, "file": discord.File(png, filename="compare.png")}
+
+    await _run(interaction, private, body)
+
+
+@app_commands.command(name="related", description="関係データから、その銘柄の関連企業（取引先・親子会社・提携先など）を表示します")
+@app_commands.describe(code="証券コード（例: 7203）", private=PRIVATE_DESC)
+@app_commands.default_permissions(manage_guild=True)
+async def related_command(interaction: discord.Interaction, code: str, private: bool = False) -> None:
+    async def body():
+        c, name = await _resolve(interaction, code)
+        client = interaction.client
+        # 上場銘柄一覧にない会社（上場廃止など）は、関連銘柄の提案と同じく表示しない
+        related = [r for r in client.relations.neighbors(c, name) if client.master.get(r.code)]
+        names = {r.code: client.master.get(r.code).name for r in related}
+        watched = {s["ticker"] for s in await db.list_monitored()}
+        held = {p["ticker"] for p in await db.vp_positions("you")}
+        embed = views.related_embed(c, name, related, names, watched, held)
+        return {"embed": embed, "view": views.link_view(c)}
+
+    await _run(interaction, private, body)
+
+
 def setup(tree: app_commands.CommandTree) -> None:
     tree.add_command(settings_command)
     tree.add_command(WatchGroup())
@@ -305,4 +453,8 @@ def setup(tree: app_commands.CommandTree) -> None:
     tree.add_command(orders_command)
     tree.add_command(battle_command)
     tree.add_command(deposit_command)
+    tree.add_command(chart_command)
+    tree.add_command(ranking_command)
+    tree.add_command(compare_command)
+    tree.add_command(related_command)
     tree.add_command(review_command)

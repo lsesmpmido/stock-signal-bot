@@ -1,4 +1,4 @@
-"""スラッシュコマンド: /settings, /watch add|remove|list, /buy, /sell, /portfolio, /review, /test proposal|signal"""
+"""スラッシュコマンド: /settings, /watch add|remove|list, /buy, /sell, /portfolio, /review, /test proposal|signal|report"""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from discord import app_commands
 import db
 import market
 import portfolio
+import reports
 import review
 import views
 from ticker_master import CODE_PATTERN, normalize_code
@@ -122,6 +123,20 @@ class TestGroup(
         if stats["posted"] + stats["related_posted"] == 0:
             text += "\n（直近 3 日以内に提案済み・監視中の銘柄は除外しています）"
         await interaction.followup.send(text, ephemeral=True)
+
+    @app_commands.command(name="report", description="定番レポートを今すぐ送ります（ON/OFF の設定に関係なく）")
+    @app_commands.describe(kind="送るレポート")
+    @app_commands.choices(
+        kind=[app_commands.Choice(name=label, value=key) for key, label in reports.REPORT_LABELS.items()]
+    )
+    async def report(self, interaction: discord.Interaction, kind: app_commands.Choice[str]) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await interaction.client.run_report(kind.value)
+        except Exception as exc:
+            await interaction.followup.send(f"⚠️ レポートの作成でエラーが発生しました: `{exc}`", ephemeral=True)
+            raise
+        await interaction.followup.send(f"✅ {kind.name}を送りました。", ephemeral=True)
 
     @app_commands.command(name="signal", description="指定した銘柄のチャート付き通知を、シグナルの有無に関係なく送ります")
     @app_commands.describe(code="証券コード（例: 7203）")

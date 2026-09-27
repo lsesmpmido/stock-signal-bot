@@ -41,6 +41,13 @@ def is_trading_day(d: date) -> bool:
     return not ((d.month == 12 and d.day == 31) or (d.month == 1 and d.day <= 3))
 
 
+def is_last_trading_day_of_week(d: date) -> bool:
+    """その週（月〜金）で最後の取引日なら True。金曜が祝日の週は木曜などになる。"""
+    if not is_trading_day(d) or d.weekday() > 4:
+        return False
+    return not any(is_trading_day(d + timedelta(days=k)) for k in range(1, 5 - d.weekday()))
+
+
 def now_jst() -> datetime:
     return datetime.now(JST)
 

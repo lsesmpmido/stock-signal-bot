@@ -25,6 +25,7 @@ import commands
 import db
 import market
 import news
+import reports
 import signals
 import views
 from jev_client import JevJudge
@@ -52,6 +53,8 @@ CLOSE_TIME = time(15, 45)
 PRICE_SYNC_TIME = time(16, 0)
 # 答え合わせなどで後から株価を使うため、直近この日数に提案した銘柄の日足も保存しておく
 PRICE_SYNC_PROPOSAL_DAYS = 35
+# 定番レポートの時刻。朝は 8:30 の提案ジョブの後、大引けは 16:00 の日足保存の後にする
+REPORT_TIMES = {"morning": time(8, 45), "close": time(16, 5), "weekly": time(16, 10)}
 
 
 def proposal_slots(freq: str, day: datetime) -> list[datetime]:
@@ -81,6 +84,15 @@ def price_sync_slots(day: datetime) -> list[datetime]:
     return [datetime.combine(day.date(), PRICE_SYNC_TIME, JST)] if market.is_trading_day(day.date()) else []
 
 
+def report_slots(kind: str, day: datetime) -> list[datetime]:
+    d = day.date()
+    if kind == "weekly":
+        ok = market.is_last_trading_day_of_week(d)
+    else:
+        ok = market.is_trading_day(d)
+    return [datetime.combine(d, REPORT_TIMES[kind], JST)] if ok else []
+
+
 def due_slot(slots: list[datetime], now: datetime) -> str | None:
     """now の直前（猶予 10 分以内）に予定されていた実行時刻。tick が遅れても取りこぼさないようにする。"""
     due = [s for s in slots if s <= now < s + SLOT_GRACE]
@@ -99,6 +111,7 @@ class StockBot(ext_commands.Bot):
         self._master_lock = asyncio.Lock()
         self._relations_lock = asyncio.Lock()
         self._price_sync_lock = asyncio.Lock()
+        self._report_lock = asyncio.Lock()
         self._background: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------ 起動・終了
@@ -177,6 +190,15 @@ class StockBot(ext_commands.Bot):
             await db.set_setting("_last_price_sync_slot", slot)
             self._spawn(self._guarded(self._price_sync_lock, self.run_price_sync_job))
 
+        for kind in reports.BUILDERS:
+            if settings.get(f"report_{kind}", "on") != "on":
+                continue
+            slot = due_slot(report_slots(kind, now), now)
+            key = f"_last_report_{kind}_slot"
+            if slot and slot != settings.get(key):
+                await db.set_setting(key, slot)
+                self._spawn(self._guarded(self._report_lock, self.run_report, kind))
+
         # 関係データは起動直後（DB キャッシュからの読み込み）と、7 日ごとの再取得をここで行う
         if self.relations.is_stale() and not self._relations_lock.locked():
             self._spawn(self._guarded(self._relations_lock, self.relations.load))
@@ -201,6 +223,18 @@ class StockBot(ext_commands.Bot):
         channel_id = int(os.environ[env_key])
         return self.get_channel(channel_id) or await self.fetch_channel(channel_id)
 
+    async def _report_channel(self) -> discord.abc.Messageable:
+        """レポートの送り先。DISCORD_CHANNEL_REPORT が未設定なら売買シグナル用チャンネル。"""
+        key = "DISCORD_CHANNEL_REPORT" if os.getenv("DISCORD_CHANNEL_REPORT") else "DISCORD_CHANNEL_SIGNAL"
+        return await self._channel(key)
+
+    # ------------------------------------------------------------ 定番レポート
+
+    async def run_report(self, kind: str) -> None:
+        embed = await reports.BUILDERS[kind](market.now_jst())
+        await (await self._report_channel()).send(embed=embed)
+        await db.log_notification("report", detail=kind)
+
     # ------------------------------------------------------------ 銘柄一覧の同期
 
     async def refresh_master(self) -> None:
@@ -223,6 +257,8 @@ class StockBot(ext_commands.Bot):
         try:
             channel = await self._channel("DISCORD_CHANNEL_SIGNAL")
             await channel.send(embed=embed)
+            for stock in removed:
+                await db.log_notification("delist", stock["ticker"], stock["company_name"])
         except Exception:  # 起動時にも呼ばれるので、通知の失敗で Bot を止めない
             log.exception("自動解除の通知に失敗しました")
 
@@ -334,6 +370,7 @@ class StockBot(ext_commands.Bot):
             if ctx is not None:
                 embed.set_footer(text="関係データ: JP Market Vis（EDINET 等から自動抽出。誤りを含む場合があります）")
             await channel.send(embed=embed, view=views.proposal_view(pending_id, info.code))
+            await db.log_notification("proposal", info.code, item.title)
         return posted
 
     # ------------------------------------------------------------ 株価の保存（大引け後）
@@ -382,6 +419,7 @@ class StockBot(ext_commands.Bot):
         for e in events:
             sent[e.key] = now.isoformat()
         label = " / ".join(e.label for e in events)
+        await db.log_notification("signal", code, label)
         await db.save_signal_state(code, {"state": state, "sent": sent}, last_signal=label)
 
     async def send_test_signal(self, code: str, name: str) -> bool:

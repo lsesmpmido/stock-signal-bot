@@ -22,6 +22,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "signal_freq": "1h",  # 15m / 1h / close / off
     "jev_positive_threshold": "0.7",
     "jev_impact_threshold": "1.0",
+    # 定番レポートの ON/OFF（on / off）
+    "report_morning": "on",
+    "report_close": "on",
+    "report_weekly": "on",
     # 仮想売買
     "vp_cash": "2400000",  # 現金残高（円）。元手は新NISA 成長投資枠の年間上限と同じ 240 万円
     "vp_fee_rate": "0",  # 売買手数料（売買代金に対する割合。例: 0.0022 = 0.22%）
@@ -93,6 +97,13 @@ CREATE TABLE IF NOT EXISTS vp_trades (
     tax          DOUBLE PRECISION NOT NULL DEFAULT 0,  -- 源泉徴収額（マイナスは還付）
     traded_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS notification_log (
+    id      BIGSERIAL PRIMARY KEY,
+    kind    TEXT NOT NULL,  -- proposal / signal / delist / report
+    ticker  TEXT,
+    detail  TEXT,
+    sent_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS price_daily (
     ticker TEXT NOT NULL,
     date   DATE NOT NULL,
@@ -113,6 +124,7 @@ ALTER TABLE company_relations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE price_daily      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE vp_positions     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE vp_trades        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE notification_log ENABLE ROW LEVEL SECURITY;
 """
 
 _pool: AsyncConnectionPool | None = None
@@ -446,3 +458,26 @@ async def vp_record_trade(
                     "ON CONFLICT (account, ticker) DO UPDATE SET shares = EXCLUDED.shares, cost = EXCLUDED.cost",
                     position,
                 )
+
+
+# ---------------------------------------------------------------- notification_log
+
+
+async def log_notification(kind: str, ticker: str | None = None, detail: str | None = None) -> None:
+    """Bot が送った通知を記録する（週間レポートの通知件数・シグナル一覧に使う）。"""
+    async with _pool_or_raise().connection() as conn:
+        await conn.execute(
+            "INSERT INTO notification_log (kind, ticker, detail) VALUES (%s, %s, %s)", (kind, ticker, detail)
+        )
+
+
+async def notifications_since(since: datetime, kind: str | None = None) -> list[dict[str, Any]]:
+    async with _pool_or_raise().connection() as conn:
+        if kind is None:
+            sql, params = "SELECT * FROM notification_log WHERE sent_at >= %s ORDER BY sent_at", (since,)
+        else:
+            sql, params = (
+                "SELECT * FROM notification_log WHERE sent_at >= %s AND kind = %s ORDER BY sent_at",
+                (since, kind),
+            )
+        return await (await conn.execute(sql, params)).fetchall()

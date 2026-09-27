@@ -31,6 +31,11 @@ SIGNAL_OPTIONS = [
     ("off", "OFF"),
 ]
 SOURCE_LABELS = {"proposal": "提案から", "manual": "手動"}
+REPORT_OPTIONS = [
+    ("morning", "🌅 朝のブリーフィング (8:45)"),
+    ("close", "🔔 大引けレポート (16:05)"),
+    ("weekly", "📅 週間レポート (週の最後の取引日 16:10)"),
+]
 
 
 # 上場企業同士の関係図。銘柄ページを直接開く URL はないので、トップページを開く
@@ -339,17 +344,45 @@ class _SettingSelect(discord.ui.Select):
         )
 
 
+class _ReportSelect(discord.ui.Select):
+    """定番レポートの ON/OFF（複数選択。選んだものが ON）。"""
+
+    def __init__(self, settings: dict[str, str]) -> None:
+        super().__init__(
+            placeholder="定番レポート（届けるものを選択）",
+            min_values=0,
+            max_values=len(REPORT_OPTIONS),
+            options=[
+                discord.SelectOption(label=label, value=kind, default=settings.get(f"report_{kind}", "on") == "on")
+                for kind, label in REPORT_OPTIONS
+            ],
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        for kind, _ in REPORT_OPTIONS:
+            await db.set_setting(f"report_{kind}", "on" if kind in self.values else "off")
+        for option in self.options:
+            option.default = option.value in self.values
+        await interaction.response.edit_message(content=settings_text(await db.get_all_settings()), view=self.view)
+
+
 class SettingsView(discord.ui.View):
     def __init__(self, settings: dict[str, str]) -> None:
         super().__init__(timeout=600)
         self.add_item(_SettingSelect("proposal_freq", "新銘柄提案", PROPOSAL_OPTIONS, settings["proposal_freq"], 0))
         self.add_item(_SettingSelect("signal_freq", "売買シグナル", SIGNAL_OPTIONS, settings["signal_freq"], 1))
+        self.add_item(_ReportSelect(settings))
 
 
 def settings_text(settings: dict[str, str]) -> str:
     proposal = dict(PROPOSAL_OPTIONS).get(settings["proposal_freq"], settings["proposal_freq"])
     signal = dict(SIGNAL_OPTIONS).get(settings["signal_freq"], settings["signal_freq"])
-    return f"⚙️ **通知設定**\n新銘柄提案: **{proposal}**\n売買シグナル: **{signal}**"
+    on = [label for kind, label in REPORT_OPTIONS if settings.get(f"report_{kind}", "on") == "on"]
+    return (
+        f"⚙️ **通知設定**\n新銘柄提案: **{proposal}**\n売買シグナル: **{signal}**\n"
+        f"定番レポート: **{'、'.join(on) if on else 'すべて OFF'}**"
+    )
 
 
 # ---------------------------------------------------------------- /watch list

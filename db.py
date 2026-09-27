@@ -33,6 +33,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "vp_deposits_ai": "2400000",
     "vp_fee_rate": "0",  # 売買手数料（売買代金に対する割合。例: 0.0022 = 0.22%）
     "vp_default_amount": "200000",  # 金額を省略したときの購入額（円）
+    "vp_next_deposit": "",  # 次回（1 月 1 日）の追加入金額（円）。空なら 240 万円
 }
 
 SCHEMA_SQL = """
@@ -199,7 +200,13 @@ async def init() -> None:
     await _pool.open(wait=True, timeout=30)
     async with _pool.connection() as conn:
         await conn.execute(SCHEMA_SQL)
-        for key, value in {**DEFAULT_SETTINGS, "vp_started_at": datetime.now(timezone.utc).isoformat()}.items():
+        initial = {
+            **DEFAULT_SETTINGS,
+            "vp_started_at": datetime.now(timezone.utc).isoformat(),
+            # 始めた年はすでに元手を入れているので、次の追加入金は翌年 1 月から
+            "_last_deposit_year": str(datetime.now(timezone(timedelta(hours=9))).year),
+        }
+        for key, value in initial.items():
             await conn.execute(
                 "INSERT INTO user_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING",
                 (key, value),

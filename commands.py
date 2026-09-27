@@ -1,4 +1,4 @@
-"""スラッシュコマンド: /settings, /watch add|remove|list, /buy, /sell, /portfolio, /orders, /review, /test proposal|signal|report"""
+"""スラッシュコマンド: /settings, /watch add|remove|list, /buy, /sell, /portfolio, /orders, /battle, /deposit, /review, /test proposal|signal|report"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import asyncio
 import discord
 from discord import app_commands
 
+import battle
 import db
 import market
 import orders
@@ -272,6 +273,28 @@ async def orders_command(interaction: discord.Interaction) -> None:
     )
 
 
+@app_commands.command(name="battle", description="AI との勝負の状況（今月の途中経過・通算成績・AI の性格）を表示します")
+@app_commands.default_permissions(manage_guild=True)
+async def battle_command(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=True)
+    try:
+        st = await battle.standing()
+        you, ai = await portfolio.summary("you"), await portfolio.summary("ai")
+    except Exception as exc:
+        await interaction.followup.send(f"⚠️ 勝負の状況の取得でエラーが発生しました: `{exc}`")
+        raise
+    await interaction.followup.send(embed=views.battle_embed(st, you, ai))
+
+
+@app_commands.command(name="deposit", description="次回（1 月 1 日）の追加入金額を指定します（あなたと AI に同じ額）")
+@app_commands.describe(amount="入金額（万円）。0 なら入金しない")
+@app_commands.default_permissions(manage_guild=True)
+async def deposit_command(interaction: discord.Interaction, amount: app_commands.Range[float, 0, 100000]) -> None:
+    yen = round(amount * 10_000)
+    await db.set_setting("vp_next_deposit", str(yen))
+    await interaction.response.send_message(f"✅ 次回（1 月 1 日）の追加入金を **{yen:,} 円** にしました。", ephemeral=True)
+
+
 def setup(tree: app_commands.CommandTree) -> None:
     tree.add_command(settings_command)
     tree.add_command(WatchGroup())
@@ -280,4 +303,6 @@ def setup(tree: app_commands.CommandTree) -> None:
     tree.add_command(sell_command)
     tree.add_command(portfolio_command)
     tree.add_command(orders_command)
+    tree.add_command(battle_command)
+    tree.add_command(deposit_command)
     tree.add_command(review_command)

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 import discord
 import pandas as pd
 
+import battle
 import db
 import market
 import portfolio
@@ -23,7 +24,7 @@ MAX_LIST = 10
 RSI_NEAR = 5  # RSI がしきい値（30 / 70）まであとこの幅以内なら「接近」
 MA_NEAR = 0.01  # 25 日線と 75 日線の差がこの割合以内なら「接近」
 MACD_NEAR = 0.1  # MACD とシグナル線の差が、直近 60 日の平均的な差のこの割合以内なら「接近」
-KIND_LABELS = {"proposal": "提案", "signal": "売買シグナル", "delist": "自動解除", "report": "レポート", "fill": "約定", "ai_trade": "AIの売買"}
+KIND_LABELS = {"proposal": "提案", "signal": "売買シグナル", "delist": "自動解除", "report": "レポート", "fill": "約定", "ai_trade": "AIの売買", "deposit": "追加入金"}
 
 
 @dataclass(frozen=True)
@@ -229,6 +230,20 @@ async def weekly(now: datetime) -> discord.Embed:
         pf.append(f"TOPIX 比 {diff:+.2%}（{'勝ち' if diff >= 0 else '負け'}）")
     pf.append(f"今年の NISA 枠の残り {s.nisa_left:,.0f} 円")
     embed.add_field(name="仮想ポートフォリオ", value="\n".join(pf), inline=False)
+
+    st = await battle.standing()
+    wins, losses, draws = st.record()
+    lines = [f"通算 あなた {wins}勝 {losses}敗 {draws}分 ・ AI の性格: {st.mode.label}"]
+    if (m := st.current) is not None:
+        lead = {"you": "あなたがリード", "ai": "AI がリード", "draw": "互角"}[m.winner]
+        lines.append(f"今月の途中経過: 🧑 {m.you:+.2%} / 🤖 {m.ai:+.2%} → {lead}")
+    ai_trades = await db.vp_trades("ai", week_start)
+    for t in ai_trades[:MAX_LIST]:
+        action = "買い" if t["side"] == "buy" else "売り"
+        lines.append(f"・🤖 {action}: {t['company_name']} ({t['ticker']}) {t['shares']:,} 株 × {t['price']:,.1f} 円")
+    if not ai_trades:
+        lines.append("今週の AI の売買はありません")
+    embed.add_field(name="🏆 AIと勝負", value="\n".join(lines)[:1024], inline=False)
 
     counts: dict[str, int] = {}
     for n in await db.notifications_since(week_start):

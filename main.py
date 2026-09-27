@@ -21,6 +21,7 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 
 import ai_trader
+import battle
 import charts
 import commands
 import db
@@ -59,6 +60,8 @@ PRICE_SYNC_PROPOSAL_DAYS = 35
 # 定番レポートの時刻。朝は 8:30 の提案ジョブの後、大引けは 16:00 の日足保存の後にする
 # 取引時間外に出た注文を始値で約定させる時刻。データの遅れで始値がまだ取れない銘柄は次の時刻に回す
 FILL_TIMES = [time(9, 30), time(10, 0), time(11, 0), time(13, 0)]
+DEFAULT_DEPOSIT = 2_400_000
+DEPOSIT_PROMPT = (12, 20, time(10, 0))  # 12 月 20 日 10:00 に、来年の入金額を確認するお知らせを送る
 REPORT_TIMES = {"morning": time(8, 45), "close": time(16, 5), "weekly": time(16, 10)}
 
 
@@ -124,6 +127,7 @@ class StockBot(ext_commands.Bot):
         self._price_sync_lock = asyncio.Lock()
         self._report_lock = asyncio.Lock()
         self._fill_lock = asyncio.Lock()
+        self._deposit_lock = asyncio.Lock()
         self._background: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------ 起動・終了
@@ -136,7 +140,11 @@ class StockBot(ext_commands.Bot):
         self.jev = JevJudge()
 
         self.add_dynamic_items(
-            views.AddPendingButton, views.SkipPendingButton, views.UnwatchButton, views.VirtualBuyButton
+            views.AddPendingButton,
+            views.SkipPendingButton,
+            views.UnwatchButton,
+            views.VirtualBuyButton,
+            views.DepositButton,
         )
         commands.setup(self.tree)
         if guild_id := os.getenv("DISCORD_GUILD_ID"):
@@ -206,6 +214,16 @@ class StockBot(ext_commands.Bot):
         if slot and slot != settings.get("_last_fill_slot") and not self._fill_lock.locked():
             await db.set_setting("_last_fill_slot", slot)
             self._spawn(self._guarded(self._fill_lock, self.run_fill_job))
+
+        # 追加入金: 12 月 20 日に金額を確認し、1 月 1 日に入金する
+        month, day, at = DEPOSIT_PROMPT
+        prompted = settings.get("_last_deposit_prompt") == str(now.year)
+        if (now.month, now.day) == (month, day) and now.time() >= at and not prompted:
+            await db.set_setting("_last_deposit_prompt", str(now.year))
+            self._spawn(self._guarded(self._deposit_lock, self.send_deposit_prompt))
+        if now.year > int(settings.get("_last_deposit_year") or now.year) and not self._deposit_lock.locked():
+            await db.set_setting("_last_deposit_year", str(now.year))
+            self._spawn(self._guarded(self._deposit_lock, self.run_deposit, settings))
 
         for kind in reports.BUILDERS:
             if settings.get(f"report_{kind}", "on") != "on":
@@ -409,7 +427,7 @@ class StockBot(ext_commands.Bot):
             log.exception("AI トレーダーの判断でエラーが発生しました")
 
     async def current_mode(self) -> ai_trader.Mode:
-        return ai_trader.MODES["normal"]
+        return await battle.current_mode()
 
     async def run_ai_trader(self) -> ai_trader.Decisions:
         """大引け後に AI が売買を判断し、翌取引日の始値で約定する注文を出す（注文の時点では知らせない）。"""
@@ -421,6 +439,35 @@ class StockBot(ext_commands.Bot):
         for owner in portfolio.OWNER_LABELS:
             s = await portfolio.summary(owner)
             await db.vp_save_snapshot(owner, today, s.total_value, s.deposits)
+
+    # ------------------------------------------------------------ 追加入金
+
+    async def send_deposit_prompt(self) -> None:
+        next_year = market.now_jst().year + 1
+        embed = discord.Embed(
+            title=f"💴 {next_year} 年の追加入金額を決めてください",
+            description=(
+                f"{next_year} 年 1 月 1 日に、あなたと AI の仮想口座へ同じ額を入金します（新NISA の枠も 240 万円に戻ります）。\n"
+                "下のボタンか `/deposit <金額(万円)>` で指定してください。指定がなければ **240 万円** を入金します。"
+            ),
+            color=discord.Color.gold(),
+        )
+        await (await self._report_channel()).send(embed=embed, view=views.deposit_view())
+        await db.log_notification("deposit", detail="prompt")
+
+    async def run_deposit(self, settings: dict[str, str]) -> None:
+        amount = float(settings.get("vp_next_deposit") or DEFAULT_DEPOSIT)
+        for owner in portfolio.OWNER_LABELS:
+            if amount > 0:
+                await db.vp_deposit(owner, amount)
+        await db.set_setting("vp_next_deposit", "")
+        embed = discord.Embed(
+            title=f"💴 {market.now_jst().year} 年の追加入金をしました",
+            description=f"あなたと AI の仮想口座に **{amount:,.0f} 円** ずつ入金しました。今年の NISA の枠は 240 万円です。",
+            color=discord.Color.gold(),
+        )
+        await (await self._report_channel()).send(embed=embed)
+        await db.log_notification("deposit", detail=f"{amount:.0f}")
 
     # ------------------------------------------------------------ 注文の約定（取引時間外の注文を翌取引日の始値で）
 

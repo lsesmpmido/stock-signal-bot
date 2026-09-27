@@ -13,6 +13,7 @@ import discord
 
 import db
 import ai_trader
+import battle
 import market
 import orders
 import portfolio
@@ -339,6 +340,61 @@ def ai_fills_embed(executed: list[orders.Executed], mode: ai_trader.Mode, now) -
                 f" ・ 保有 {r.held_days} 日{tax}\n　{detail}"
             )
     embed.description = "\n".join(lines)[:4000]
+    return embed
+
+
+# ---------------------------------------------------------------- 追加入金・AI との勝負
+
+DEPOSIT_CHOICES = [(2_400_000, "240万円"), (1_200_000, "120万円"), (0, "入金しない")]
+
+
+class DepositButton(discord.ui.DynamicItem[discord.ui.Button], template=r"deposit:(?P<amount>[0-9]+)"):
+    def __init__(self, amount: int) -> None:
+        label = dict(DEPOSIT_CHOICES).get(amount, f"{amount:,} 円")
+        super().__init__(
+            discord.ui.Button(label=label, style=discord.ButtonStyle.primary, custom_id=f"deposit:{amount}")
+        )
+        self.amount = amount
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match) -> Any:
+        return cls(int(match["amount"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await db.set_setting("vp_next_deposit", str(self.amount))
+        await interaction.response.send_message(f"✅ 次回の追加入金を **{self.amount:,} 円** にしました。", ephemeral=True)
+
+
+def deposit_view() -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    for amount, _ in DEPOSIT_CHOICES:
+        view.add_item(DepositButton(amount))
+    return view
+
+
+def battle_embed(st: battle.Standing, you: portfolio.Summary, ai: portfolio.Summary) -> discord.Embed:
+    wins, losses, draws = st.record()
+    embed = discord.Embed(title="🏆 AI vs あなた", color=discord.Color.orange())
+    lines = [f"通算成績（月ごと）: あなた **{wins}勝 {losses}敗 {draws}分**", f"AI の今の性格: {st.mode.label}"]
+    if (m := st.current) is not None:
+        lead = {"you": "あなたがリード", "ai": "AI がリード", "draw": "互角"}[m.winner]
+        lines.append(f"\n**今月（{m.month}）の途中経過**: 🧑 {m.you:+.2%} / 🤖 {m.ai:+.2%} → {lead}")
+    else:
+        lines.append("\n今月の記録はまだありません（大引け後に毎日記録します）。")
+    embed.description = "\n".join(lines)
+    for label, s in (("🧑 あなた", you), ("🤖 AI", ai)):
+        embed.add_field(
+            name=label,
+            value=f"総資産 {_yen(s.total_value)}（通算 {s.total_return:+.2%}）\n保有 {len(s.holdings)} 銘柄 ・ 現金 {_yen(s.cash)}",
+        )
+    if st.finished:
+        history = [
+            f"{m.month}: 🧑 {m.you:+.2%} / 🤖 {m.ai:+.2%} → "
+            + {"you": "あなたの勝ち", "ai": "AI の勝ち", "draw": "引き分け"}[m.winner]
+            for m in st.finished[-6:]
+        ]
+        embed.add_field(name="これまでの月", value="\n".join(history), inline=False)
+    embed.set_footer(text="総資産の増減率（税金・手数料込み、入金分を除く）で比べる。差が 0.05% 以内は引き分け")
     return embed
 
 

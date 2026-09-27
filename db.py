@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
@@ -64,6 +64,16 @@ CREATE TABLE IF NOT EXISTS company_relations (
     fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (source, target, relation_type)
 );
+CREATE TABLE IF NOT EXISTS price_daily (
+    ticker TEXT NOT NULL,
+    date   DATE NOT NULL,
+    open   DOUBLE PRECISION,
+    high   DOUBLE PRECISION,
+    low    DOUBLE PRECISION,
+    close  DOUBLE PRECISION NOT NULL,
+    volume BIGINT,
+    PRIMARY KEY (ticker, date)
+);
 -- テーブルを REST API などで外部公開するサービスでも第三者に読み書きされないよう、RLS を有効化しておく。
 -- (Bot はテーブル所有者のロールで接続するので RLS の影響を受けない)
 ALTER TABLE pending_stocks   ENABLE ROW LEVEL SECURITY;
@@ -71,6 +81,7 @@ ALTER TABLE monitored_stocks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE user_settings    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ticker_master    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE company_relations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE price_daily      ENABLE ROW LEVEL SECURITY;
 """
 
 _pool: AsyncConnectionPool | None = None
@@ -269,3 +280,64 @@ async def replace_relations(rows: list[dict[str, Any]]) -> datetime:
                     [(r["source"], r["target"], r["relation_type"], now) for r in rows],
                 )
     return now
+
+
+# ---------------------------------------------------------------- price_daily
+
+PriceRow = tuple[str, date, float | None, float | None, float | None, float, int | None]
+
+
+async def price_coverage(tickers: list[str]) -> dict[str, date]:
+    """銘柄ごとの、保存済みの最新日付。1 件も保存していない銘柄は含まれない。"""
+    async with _pool_or_raise().connection() as conn:
+        rows = await (
+            await conn.execute(
+                "SELECT ticker, max(date) AS last FROM price_daily WHERE ticker = ANY(%s) GROUP BY ticker",
+                (tickers,),
+            )
+        ).fetchall()
+    return {r["ticker"]: r["last"] for r in rows}
+
+
+async def load_prices(tickers: list[str], since: date) -> list[dict[str, Any]]:
+    async with _pool_or_raise().connection() as conn:
+        return await (
+            await conn.execute(
+                "SELECT ticker, date, open, high, low, close, volume FROM price_daily "
+                "WHERE ticker = ANY(%s) AND date >= %s ORDER BY ticker, date",
+                (tickers, since),
+            )
+        ).fetchall()
+
+
+async def upsert_prices(rows: list[PriceRow]) -> None:
+    """日足を保存する。同じ銘柄・日付があれば上書きする（場中の途中経過の足を、最新値や確定値で置き換える）。"""
+    if not rows:
+        return
+    async with _pool_or_raise().connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.executemany(
+                "INSERT INTO price_daily (ticker, date, open, high, low, close, volume) VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (ticker, date) DO UPDATE SET open = EXCLUDED.open, high = EXCLUDED.high, "
+                "low = EXCLUDED.low, close = EXCLUDED.close, volume = EXCLUDED.volume",
+                rows,
+            )
+
+
+async def replace_prices(ticker: str, rows: list[PriceRow]) -> None:
+    """銘柄の日足をまるごと入れ替える（株式分割で過去の株価が修正されたとき用）。"""
+    async with _pool_or_raise().connection() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM price_daily WHERE ticker = %s", (ticker,))
+            async with conn.cursor() as cur:
+                await cur.executemany(
+                    "INSERT INTO price_daily (ticker, date, open, high, low, close, volume) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    rows,
+                )
+
+
+async def prune_prices(before: date) -> int:
+    """指定日より古い日足を削除し、削除した行数を返す。"""
+    async with _pool_or_raise().connection() as conn:
+        cur = await conn.execute("DELETE FROM price_daily WHERE date < %s", (before,))
+        return cur.rowcount

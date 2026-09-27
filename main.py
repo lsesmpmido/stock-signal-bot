@@ -48,6 +48,10 @@ PROPOSAL_TIMES = {"twice": [time(8, 30), time(16, 0)], "once": [time(8, 30)]}
 SESSIONS = [(time(9, 15), time(11, 45)), (time(12, 45), time(15, 45))]
 HOURLY_TIMES = [time(h) for h in (10, 11, 12, 13, 14, 15)] + [time(15, 45)]
 CLOSE_TIME = time(15, 45)
+# 大引け後、確定した日足を DB に保存する時刻（データの遅れを見込んで少し遅らせる）
+PRICE_SYNC_TIME = time(16, 0)
+# 答え合わせなどで後から株価を使うため、直近この日数に提案した銘柄の日足も保存しておく
+PRICE_SYNC_PROPOSAL_DAYS = 35
 
 
 def proposal_slots(freq: str, day: datetime) -> list[datetime]:
@@ -73,6 +77,10 @@ def signal_slots(freq: str, day: datetime) -> list[datetime]:
     return []
 
 
+def price_sync_slots(day: datetime) -> list[datetime]:
+    return [datetime.combine(day.date(), PRICE_SYNC_TIME, JST)] if market.is_trading_day(day.date()) else []
+
+
 def due_slot(slots: list[datetime], now: datetime) -> str | None:
     """now の直前（猶予 10 分以内）に予定されていた実行時刻。tick が遅れても取りこぼさないようにする。"""
     due = [s for s in slots if s <= now < s + SLOT_GRACE]
@@ -90,6 +98,7 @@ class StockBot(ext_commands.Bot):
         self._signal_lock = asyncio.Lock()
         self._master_lock = asyncio.Lock()
         self._relations_lock = asyncio.Lock()
+        self._price_sync_lock = asyncio.Lock()
         self._background: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------ 起動・終了
@@ -160,6 +169,11 @@ class StockBot(ext_commands.Bot):
 
         if self.master.is_stale() and not self._master_lock.locked():
             self._spawn(self._guarded(self._master_lock, self.refresh_master))
+
+        slot = due_slot(price_sync_slots(now), now)
+        if slot and slot != settings.get("_last_price_sync_slot") and not self._price_sync_lock.locked():
+            await db.set_setting("_last_price_sync_slot", slot)
+            self._spawn(self._guarded(self._price_sync_lock, self.run_price_sync_job))
 
         # 関係データは起動直後（DB キャッシュからの読み込み）と、7 日ごとの再取得をここで行う
         if self.relations.is_stale() and not self._relations_lock.locked():
@@ -319,13 +333,24 @@ class StockBot(ext_commands.Bot):
             await channel.send(embed=embed, view=views.proposal_view(pending_id, info.code))
         return posted
 
+    # ------------------------------------------------------------ 株価の保存（大引け後）
+
+    async def run_price_sync_job(self) -> None:
+        """監視銘柄・直近の提案銘柄・指数の確定した日足を DB に保存し、古い日足を削除する。"""
+        codes = [s["ticker"] for s in await db.list_monitored()]
+        codes += sorted(await db.recently_proposed_tickers(PRICE_SYNC_PROPOSAL_DAYS))
+        codes += list(market.INDEX_CODES)
+        daily = await market.get_daily(codes)
+        pruned = await market.prune_old_prices()
+        log.info("日足を保存しました (%d / %d 銘柄、古い日足 %d 行を削除)", len(daily), len(set(codes)), pruned)
+
     # ------------------------------------------------------------ モジュール3: 売買シグナル
 
     async def run_signal_job(self) -> None:
         stocks = await db.list_monitored()
         if not stocks:
             return
-        daily = await market.fetch_daily([s["ticker"] for s in stocks])
+        daily = await market.get_daily([s["ticker"] for s in stocks])
         channel = await self._channel("DISCORD_CHANNEL_SIGNAL")
         now = market.now_jst()
         for stock in stocks:
@@ -358,7 +383,7 @@ class StockBot(ext_commands.Bot):
 
     async def send_test_signal(self, code: str, name: str) -> bool:
         """シグナルの有無に関係なく、現在の状態をチャート付きで送る（/test signal 用）。監視状態は変更しない。"""
-        df = (await market.fetch_daily([code])).get(code)
+        df = (await market.get_daily([code])).get(code)
         if df is None or len(df) < 80:
             return False
         channel = await self._channel("DISCORD_CHANNEL_SIGNAL")

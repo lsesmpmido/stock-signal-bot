@@ -1,30 +1,37 @@
-"""yfinance からの株価取得（キャッシュ・リトライ付き）と、東証の取引日判定。"""
+"""株価の取得と東証の取引日判定。
+
+日足は DB（price_daily）にキャッシュする。初めて扱う銘柄だけ長期間をダウンロードし、
+以後は直近数日分だけを取りに行って DB を更新する（yfinance の呼び出しとレート制限を抑えるため）。
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import jpholiday
 import pandas as pd
 import yfinance as yf
 
+import db
+
 log = logging.getLogger(__name__)
 
 JST = ZoneInfo("Asia/Tokyo")
 OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 CHUNK_SIZE = 20
-CACHE_TTL_SECONDS = 600
 MAX_ATTEMPTS = 4
-
-_daily_cache: dict[str, tuple[float, pd.DataFrame]] = {}
+FULL_HISTORY = "5y"  # 初めて扱う銘柄のダウンロード期間
+RECENT_OVERLAP_DAYS = 7  # 差分取得で、保存済みの最新日からさかのぼる日数
+SPLIT_TOLERANCE = 0.005  # 保存済みの終値と 0.5% 以上ずれたら、株式分割などで過去が修正されたとみなす
+INDEX_CODES = ("^N225", "1306")  # 日経平均と TOPIX 連動 ETF（TOPIX 指数は yfinance で取れないことが多いため）
 
 
 def symbol(code: str) -> str:
-    return f"{code}.T"
+    return code if code.startswith("^") else f"{code}.T"
 
 
 def is_trading_day(d: date) -> bool:
@@ -55,18 +62,6 @@ def _with_retry(func, *args):
     return None
 
 
-def _download_daily(symbols: list[str]) -> pd.DataFrame:
-    return yf.download(
-        symbols,
-        period="2y",
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=True,
-        progress=False,
-        threads=False,
-    )
-
-
 def _split_by_symbol(raw: pd.DataFrame, symbols: list[str]) -> dict[str, pd.DataFrame]:
     frames = {}
     for sym in symbols:
@@ -82,39 +77,117 @@ def _split_by_symbol(raw: pd.DataFrame, symbols: list[str]) -> dict[str, pd.Data
     return frames
 
 
-def _fetch_daily_sync(codes: list[str]) -> dict[str, pd.DataFrame]:
-    now = time.time()
+def _download_sync(codes: list[str], **period) -> dict[str, pd.DataFrame]:
+    """codes の日足をまとめてダウンロードする。period は period="5y" か start=date(...)。取れなかった銘柄は含まれない。"""
     result: dict[str, pd.DataFrame] = {}
-    missing = []
-    for code in codes:
-        hit = _daily_cache.get(code)
-        if hit and now - hit[0] < CACHE_TTL_SECONDS:
-            result[code] = hit[1]
-        else:
-            missing.append(code)
-    for i in range(0, len(missing), CHUNK_SIZE):
-        chunk = missing[i : i + CHUNK_SIZE]
+    for i in range(0, len(codes), CHUNK_SIZE):
+        chunk = codes[i : i + CHUNK_SIZE]
         symbols = [symbol(c) for c in chunk]
         try:
-            raw = _with_retry(_download_daily, symbols)
+            raw = _with_retry(
+                lambda: yf.download(
+                    symbols,
+                    interval="1d",
+                    group_by="ticker",
+                    # 配当で過去の株価が毎回少しずつ変わると差分更新と合わないので、配当補正はしない（分割補正のみ）
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                    **period,
+                )
+            )
         except Exception:
             log.exception("日足の取得に失敗: %s", chunk)
             continue
         frames = _split_by_symbol(raw, symbols)
         for code in chunk:
             if (df := frames.get(symbol(code))) is not None:
-                _daily_cache[code] = (now, df)
                 result[code] = df
-        if i + CHUNK_SIZE < len(missing):
+        if i + CHUNK_SIZE < len(codes):
             time.sleep(2)
     return result
 
 
-async def fetch_daily(codes: list[str]) -> dict[str, pd.DataFrame]:
-    """複数銘柄の日足（2 年分）をまとめて取得する。取得できなかった銘柄は結果に含まれない。"""
+def _to_rows(code: str, df: pd.DataFrame) -> list[db.PriceRow]:
+    def num(v):
+        return None if pd.isna(v) else float(v)
+
+    return [
+        (
+            code,
+            ts.date(),
+            num(r["Open"]),
+            num(r["High"]),
+            num(r["Low"]),
+            float(r["Close"]),
+            None if pd.isna(r["Volume"]) else int(r["Volume"]),
+        )
+        for ts, r in df.iterrows()
+    ]
+
+
+def _was_restated(stored: dict[date, float], fetched: pd.DataFrame, last_stored: date) -> bool:
+    """差分で取った終値が、保存済みの確定値と食い違っていれば True（株式分割で過去の株価が修正された場合など）。
+    保存済みの最新日は場中の途中経過のことがあるので比べない。"""
+    for ts, close in fetched["Close"].items():
+        d = ts.date()
+        if d < last_stored and d in stored and abs(close / stored[d] - 1) > SPLIT_TOLERANCE:
+            return True
+    return False
+
+
+async def get_daily(codes: list[str], years: int = 2, refresh: bool = True) -> dict[str, pd.DataFrame]:
+    """codes の日足を、直近 years 年分返す。
+
+    - DB にまだない銘柄は、5 年分をダウンロードして保存する
+    - refresh=True なら、保存済みの銘柄も直近分をダウンロードして上書きする（場中なら「今日の足」も最新になる）
+    - ダウンロードに失敗した銘柄は、DB にある分だけを返す（DB にもなければ結果に含まれない）
+    """
+    codes = list(dict.fromkeys(codes))
     if not codes:
         return {}
-    return await asyncio.to_thread(_fetch_daily_sync, codes)
+    coverage = await db.price_coverage(codes)
+    missing = [c for c in codes if c not in coverage]
+    stored_codes = [c for c in codes if c in coverage] if refresh else []
+
+    if missing:
+        full = await asyncio.to_thread(_download_sync, missing, period=FULL_HISTORY)
+        for code, df in full.items():
+            await db.upsert_prices(_to_rows(code, df))
+
+    if stored_codes:
+        since = min(coverage[c] for c in stored_codes) - timedelta(days=RECENT_OVERLAP_DAYS)
+        recent = await asyncio.to_thread(_download_sync, stored_codes, start=since)
+        stored: dict[str, dict[date, float]] = {}
+        for r in await db.load_prices(list(recent), since):
+            stored.setdefault(r["ticker"], {})[r["date"]] = r["close"]
+        restated = [c for c, df in recent.items() if _was_restated(stored.get(c, {}), df, coverage[c])]
+        for code, df in recent.items():
+            if code not in restated:
+                await db.upsert_prices(_to_rows(code, df))
+        if restated:
+            log.info("過去の株価が修正されていたため取り直します（株式分割など）: %s", restated)
+            full = await asyncio.to_thread(_download_sync, restated, period=FULL_HISTORY)
+            for code, df in full.items():
+                await db.replace_prices(code, _to_rows(code, df))
+
+    since = now_jst().date() - timedelta(days=366 * years)
+    frames: dict[str, list[dict]] = {}
+    for r in await db.load_prices(codes, since):
+        frames.setdefault(r["ticker"], []).append(r)
+    return {code: _rows_to_frame(rows) for code, rows in frames.items()}
+
+
+def _rows_to_frame(rows: list[dict]) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    df.index = pd.DatetimeIndex(pd.to_datetime(df["date"]), name="Date")
+    df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
+    return df[OHLCV].astype(float)
+
+
+async def prune_old_prices(years: int = 6) -> int:
+    """years 年より古い日足を DB から削除する。"""
+    return await db.prune_prices(now_jst().date() - timedelta(days=366 * years))
 
 
 def _fetch_intraday_sync(code: str) -> pd.DataFrame | None:

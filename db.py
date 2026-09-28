@@ -27,6 +27,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "report_close": "on",
     "report_weekly": "on",
     "report_cleanup": "on",  # 週末の整理タイム
+    "report_quiz": "on",  # 銘柄当てクイズ
+    "report_thread": "on",  # 週末の振り返りスレッド
     "watch_limit": "10",  # 監視できる銘柄数の上限
     # 仮想売買
     "vp_cash": "2400000",  # 自分の現金残高（円）。元手は新NISA 成長投資枠の年間上限と同じ 240 万円
@@ -180,6 +182,25 @@ CREATE TABLE IF NOT EXISTS news_judgements (
     judged_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (ticker, news_url)
 );
+-- 銘柄当てクイズ（取引日の昼に出題し、次の出題のときに答えを発表する）
+CREATE TABLE IF NOT EXISTS quizzes (
+    id          BIGSERIAL PRIMARY KEY,
+    asked_on    DATE NOT NULL UNIQUE,
+    answer      TEXT NOT NULL,  -- 正解の証券コード
+    answer_name TEXT NOT NULL,
+    choices     JSONB NOT NULL,  -- [[証券コード, 銘柄名], ...]
+    change      DOUBLE PRECISION,  -- 出題したチャートの期間の騰落率
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revealed_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS quiz_answers (
+    quiz_id     BIGINT NOT NULL,
+    user_id     BIGINT NOT NULL,
+    user_name   TEXT NOT NULL,
+    choice      TEXT NOT NULL,
+    answered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (quiz_id, user_id)
+);
 -- AI の大引け後の判断（銘柄ごとの売買・見送りと確信度）。翌取引日の朝にまとめて知らせる
 CREATE TABLE IF NOT EXISTS ai_decisions (
     decided_on  DATE PRIMARY KEY,
@@ -220,6 +241,8 @@ ALTER TABLE price_alerts     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notification_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ai_decisions     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE news_judgements  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE quizzes          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE quiz_answers     ENABLE ROW LEVEL SECURITY;
 """
 
 _pool: AsyncConnectionPool | None = None
@@ -744,6 +767,76 @@ async def judgements(ticker: str, since: datetime) -> list[dict[str, Any]]:
             await conn.execute(
                 "SELECT * FROM news_judgements WHERE ticker = %s AND judged_at >= %s ORDER BY judged_at", (ticker, since)
             )
+        ).fetchall()
+
+
+# ---------------------------------------------------------------- quizzes
+
+
+async def add_quiz(asked_on: date, answer: str, answer_name: str, choices: list, change: float | None) -> int | None:
+    """クイズを保存して id を返す。同じ日のクイズがすでにあれば None。"""
+    async with _pool_or_raise().connection() as conn:
+        row = await (
+            await conn.execute(
+                "INSERT INTO quizzes (asked_on, answer, answer_name, choices, change) VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT (asked_on) DO NOTHING RETURNING id",
+                (asked_on, answer, answer_name, Jsonb(choices), change),
+            )
+        ).fetchone()
+    return row["id"] if row else None
+
+
+async def get_quiz(quiz_id: int) -> dict[str, Any] | None:
+    async with _pool_or_raise().connection() as conn:
+        return await (await conn.execute("SELECT * FROM quizzes WHERE id = %s", (quiz_id,))).fetchone()
+
+
+async def recent_quiz_answers(limit: int = 30) -> list[str]:
+    """直近のクイズの正解（同じ銘柄を続けて出さないために使う）。"""
+    async with _pool_or_raise().connection() as conn:
+        rows = await (await conn.execute("SELECT answer FROM quizzes ORDER BY asked_on DESC LIMIT %s", (limit,))).fetchall()
+    return [r["answer"] for r in rows]
+
+
+async def unrevealed_quizzes(before: date) -> list[dict[str, Any]]:
+    async with _pool_or_raise().connection() as conn:
+        return await (
+            await conn.execute(
+                "SELECT * FROM quizzes WHERE revealed_at IS NULL AND asked_on < %s ORDER BY asked_on", (before,)
+            )
+        ).fetchall()
+
+
+async def mark_quiz_revealed(quiz_id: int) -> None:
+    async with _pool_or_raise().connection() as conn:
+        await conn.execute("UPDATE quizzes SET revealed_at = now() WHERE id = %s", (quiz_id,))
+
+
+async def answer_quiz(quiz_id: int, user_id: int, user_name: str, choice: str) -> str | None:
+    """回答を記録する。すでに回答していたら、その回答（変えられない）を返す。"""
+    async with _pool_or_raise().connection() as conn:
+        row = await (
+            await conn.execute(
+                "INSERT INTO quiz_answers (quiz_id, user_id, user_name, choice) VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (quiz_id, user_id) DO NOTHING RETURNING choice",
+                (quiz_id, user_id, user_name, choice),
+            )
+        ).fetchone()
+        if row:
+            return None
+        return (
+            await (
+                await conn.execute(
+                    "SELECT choice FROM quiz_answers WHERE quiz_id = %s AND user_id = %s", (quiz_id, user_id)
+                )
+            ).fetchone()
+        )["choice"]
+
+
+async def quiz_answers(quiz_id: int) -> list[dict[str, Any]]:
+    async with _pool_or_raise().connection() as conn:
+        return await (
+            await conn.execute("SELECT * FROM quiz_answers WHERE quiz_id = %s ORDER BY answered_at", (quiz_id,))
         ).fetchall()
 
 

@@ -311,3 +311,22 @@ def sentiment_chart(code: str, name: str, judged: pd.DataFrame, daily: pd.DataFr
         ax.set_title(f"{name} ({code}) ニュースの感情スコアの推移", fontsize=14, color=TEXT, loc="left")
         fig.autofmt_xdate()
     return _to_png(fig)
+
+
+def quiz_chart(daily: pd.DataFrame) -> io.BytesIO:
+    """銘柄当てクイズのチャート。価格と日付を隠し、期間の初日を 100 にそろえて描く。"""
+    close = daily["Close"] / daily["Close"].iloc[0] * 100
+    with plt.rc_context({"font.family": FONT_FAMILY}):
+        fig, ax = plt.subplots(figsize=(11, 5))
+        fig.patch.set_facecolor(SURFACE)
+        ax.set_facecolor(SURFACE)
+        ax.plot(range(len(close)), close.values, color=MA_COLORS["MA25"], linewidth=2)
+        ax.fill_between(range(len(close)), close.values, close.min(), color=MA_COLORS["MA25"], alpha=0.08)
+        ax.axhline(100, color=GRID, linewidth=1)
+        ax.set_xticks([0, len(close) - 1], ["約 6 か月前", "直近"])
+        ax.set_ylabel("初日を 100 とした値", color=TEXT)
+        ax.grid(color=GRID, linewidth=0.6, axis="y")
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        ax.set_title("この値動きの銘柄はどれ？", fontsize=14, color=TEXT, loc="left")
+    return _to_png(fig)

@@ -26,7 +26,7 @@ MAX_LIST = 10
 RSI_NEAR = 5  # RSI がしきい値（30 / 70）まであとこの幅以内なら「接近」
 MA_NEAR = 0.01  # 25 日線と 75 日線の差がこの割合以内なら「接近」
 MACD_NEAR = 0.1  # MACD とシグナル線の差が、直近 60 日の平均的な差のこの割合以内なら「接近」
-KIND_LABELS = {"proposal": "提案", "signal": "売買シグナル", "delist": "自動解除", "report": "レポート", "fill": "約定", "ai_trade": "AIの売買", "deposit": "追加入金", "alert": "価格アラート", "cleanup": "整理タイム", "reset": "勝負のやり直し", "ai_decisions": "AIの判断", "pick": "今日の1銘柄", "hot": "話題銘柄の急騰・急落"}
+KIND_LABELS = {"proposal": "提案", "signal": "売買シグナル", "delist": "自動解除", "report": "レポート", "fill": "約定", "ai_trade": "AIの売買", "deposit": "追加入金", "alert": "価格アラート", "cleanup": "整理タイム", "reset": "勝負のやり直し", "ai_decisions": "AIの判断", "pick": "今日の1銘柄", "hot": "話題銘柄の急騰・急落", "quiz": "銘柄当てクイズ", "thread": "振り返りスレッド"}
 
 
 @dataclass(frozen=True)
@@ -233,6 +233,28 @@ async def close(now: datetime) -> discord.Embed:
     if seeds := await _related_seeds(now):
         embed.add_field(name="🔗 連想買いの芽（関連銘柄として提案した銘柄の、その後）", value=seeds, inline=False)
     embed.set_footer(text="株価は今日の終値")
+    return embed
+
+
+async def weekly_look_back(now: datetime) -> discord.Embed:
+    """週末の振り返りスレッドの最初のメッセージ: 今週の自分と AI の売買、監視・保有銘柄の週間騰落。"""
+    week_start = _week_start(now)
+    embed = discord.Embed(
+        title=f"📝 今週の振り返り（{week_start:%m/%d}〜{now - timedelta(days=1):%m/%d}）", color=discord.Color.blurple()
+    )
+    for owner, label in (("you", "🧑 あなたの売買"), ("ai", "🤖 AI の売買")):
+        trades = await db.vp_trades(owner, week_start)
+        lines = [
+            f"・{'買い' if t['side'] == 'buy' else '売り'}: {t['company_name']} ({t['ticker']}) {t['shares']:,} 株 × {t['price']:,.1f} 円"
+            for t in trades[:MAX_LIST]
+        ]
+        embed.add_field(name=label, value="\n".join(lines) or "今週はありません", inline=False)
+    watch, held, names = await _targets()
+    tickers = list(dict.fromkeys([*watch, *held]))
+    daily = await market.get_daily(tickers, refresh=False) if tickers else {}
+    moves = _moves(tickers, names, daily, lambda df: _change_since(df, week_start))
+    embed.add_field(name="監視・保有銘柄の今週の騰落", value=_ranking(moves), inline=False)
+    embed.set_footer(text="このメッセージのスレッドに、今週のメモを書き込めます")
     return embed
 
 

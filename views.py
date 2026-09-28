@@ -46,6 +46,8 @@ REPORT_OPTIONS = [
     ("close", "🔔 大引けレポート (16:05)"),
     ("weekly", "📅 週間レポート (週の最後の取引日 16:10)"),
     ("cleanup", "🧹 週末の整理タイム (土曜 10:00)"),
+    ("quiz", "🧩 銘柄当てクイズ (取引日 12:00)"),
+    ("thread", "📝 週末の振り返りスレッド (土曜 9:00)"),
 ]
 
 
@@ -248,6 +250,55 @@ class WhyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"why:(?P<co
             embed.description = "直近 2 日に、この社名のニュースは見つかりませんでした（市場全体の動きかもしれません）。"
         embed.set_footer(text="Google News で社名を検索した直近 2 日の記事。値動きとの関係は記事を見て確かめてください")
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class QuizButton(discord.ui.DynamicItem[discord.ui.Button], template=r"quiz:(?P<quiz_id>[0-9]+):(?P<code>[0-9A-Z]+)"):
+    """銘柄当てクイズの選択肢。1 人 1 回だけ答えられ、答えは次の出題のときに発表する。"""
+
+    def __init__(self, quiz_id: int, code: str, label: str = "選択肢") -> None:
+        super().__init__(
+            discord.ui.Button(label=label[:80], style=discord.ButtonStyle.secondary, custom_id=f"quiz:{quiz_id}:{code}")
+        )
+        self.quiz_id, self.code = quiz_id, code
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match) -> Any:
+        return cls(int(match["quiz_id"]), match["code"], item.label or "選択肢")
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        q = await db.get_quiz(self.quiz_id)
+        if q is None or q["revealed_at"] is not None:
+            await interaction.response.send_message("このクイズはもう締め切りました。", ephemeral=True)
+            return
+        names = dict(q["choices"])
+        before = await db.answer_quiz(self.quiz_id, interaction.user.id, interaction.user.display_name, self.code)
+        if before is not None:
+            text = f"もう「{names.get(before, before)}」と答えています（答えは変えられません）。"
+        else:
+            text = f"「{names.get(self.code, self.code)}」で受け付けました。答えは次の取引日の 12:00 に発表します。"
+        await interaction.response.send_message(text, ephemeral=True)
+
+
+def quiz_view(quiz_id: int, choices: list[tuple[str, str]]) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    for code, name in choices:
+        view.add_item(QuizButton(quiz_id, code, name))
+    return view
+
+
+def quiz_answer_embed(q: dict, answers: list[dict]) -> discord.Embed:
+    """クイズの答え合わせ。"""
+    right = [a["user_name"] for a in answers if a["choice"] == q["answer"]]
+    embed = discord.Embed(
+        title=f"🧩 {q['asked_on']:%m/%d} のクイズの答え: {q['answer_name']} ({q['answer']})",
+        description=(
+            (f"チャートの期間（約 6 か月）の値動き {q['change']:+.1%}\n" if q["change"] is not None else "")
+            + f"回答 {len(answers)} 人 ・ 正解 {len(right)} 人"
+            + (f"\n🎉 正解: {'、'.join(right)}" if right else "")
+        ),
+        color=discord.Color.green() if right else discord.Color.light_grey(),
+    )
+    return embed
 
 
 class VirtualBuyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"vp:buy:(?P<code>[0-9A-Z]+)"):

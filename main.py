@@ -28,6 +28,7 @@ import market
 import news
 import orders
 import portfolio
+import quiz
 import reports
 import signals
 import views
@@ -66,6 +67,8 @@ DEFAULT_DEPOSIT = 2_400_000
 DEPOSIT_PROMPT = (12, 20, time(10, 0))  # 12 月 20 日 10:00 に、来年の入金額を確認するお知らせを送る
 # 週末の整理タイム（土曜 10:00）
 CLEANUP_TIME = time(10, 0)
+QUIZ_TIME = time(12, 0)  # 銘柄当てクイズ（取引日。前回の答えを発表してから出題する）
+THREAD_TIME = time(9, 0)  # 週末の振り返りスレッド（土曜）
 REPORT_TIMES = {"morning": time(8, 45), "close": time(16, 5), "weekly": time(16, 10)}
 
 
@@ -115,6 +118,14 @@ def hot_slots(day: datetime) -> list[datetime]:
 def alert_slots(day: datetime) -> list[datetime]:
     """価格アラートを調べる時刻（取引日の場中、15 分おき）。"""
     return signal_slots("15m", day)
+
+
+def quiz_slots(day: datetime) -> list[datetime]:
+    return [datetime.combine(day.date(), QUIZ_TIME, JST)] if market.is_trading_day(day.date()) else []
+
+
+def thread_slots(day: datetime) -> list[datetime]:
+    return [datetime.combine(day.date(), THREAD_TIME, JST)] if day.weekday() == 5 else []
 
 
 def cleanup_slots(day: datetime) -> list[datetime]:
@@ -188,6 +199,7 @@ class StockBot(ext_commands.Bot):
             views.UnwatchButton,
             views.VirtualBuyButton,
             views.WhyButton,
+            views.QuizButton,
             views.DepositButton,
             views.PruneButton,
         )
@@ -284,6 +296,13 @@ class StockBot(ext_commands.Bot):
         ):
             await db.set_setting("_last_hot_slot", slot)
             self._spawn(self._guarded(self._hot_lock, self.run_hot_job))
+
+        for kind, slots, job in (("quiz", quiz_slots, self.run_quiz), ("thread", thread_slots, self.run_weekly_thread)):
+            slot = due_slot(slots(now), now)
+            key = f"_last_{kind}_slot"
+            if settings.get(f"report_{kind}", "on") == "on" and slot and slot != settings.get(key):
+                await db.set_setting(key, slot)
+                self._spawn(self._guarded(self._report_lock, job))
 
         slot = due_slot(cleanup_slots(now), now)
         if settings.get("report_cleanup", "on") == "on" and slot and slot != settings.get("_last_cleanup_slot"):
@@ -654,6 +673,57 @@ class StockBot(ext_commands.Bot):
             view.add_item(views.WhyButton(code))
             await channel.send(embed=embed, view=view)
             await db.log_notification("hot", code, f"{change:+.3f}")
+
+    async def run_quiz(self) -> None:
+        """前回までのクイズの答えを発表してから、今日のクイズを出題する。"""
+        now = market.now_jst()
+        channel = await self._report_channel()
+        for q in await db.unrevealed_quizzes(now.date()):
+            await channel.send(embed=views.quiz_answer_embed(q, await db.quiz_answers(q["id"])))
+            await db.mark_quiz_revealed(q["id"])
+        question = await quiz.make_question(self.master, now)
+        if question is None:
+            log.info("クイズに出せる銘柄がありません（監視銘柄・保有銘柄・直近の提案銘柄がない）")
+            return
+        quiz_id = await db.add_quiz(now.date(), question.code, question.name, question.choices, question.change)
+        if quiz_id is None:
+            return  # 今日はもう出題した
+        png = await asyncio.to_thread(charts.quiz_chart, question.chart)
+        embed = discord.Embed(
+            title=f"🧩 銘柄当てクイズ（{now:%m/%d}）",
+            description=(
+                f"この約 6 か月の値動きは、どの銘柄でしょう？（{question.change:+.0%}）\n"
+                f"ヒント: 業種は **{question.sector}**\n答えは次の取引日の 12:00 に発表します（1 人 1 回）"
+            ),
+            color=discord.Color.purple(),
+        )
+        embed.set_image(url="attachment://quiz.png")
+        await channel.send(
+            embed=embed, file=discord.File(png, filename="quiz.png"), view=views.quiz_view(quiz_id, question.choices)
+        )
+        await db.log_notification("quiz", question.code)
+
+    async def run_weekly_thread(self) -> None:
+        """土曜に「今週の振り返り」のメッセージを送り、そこから自分のメモを書き込めるスレッドを作る。"""
+        now = market.now_jst()
+        week_start = reports._week_start(now)
+        channel = await self._report_channel()
+        embed = await reports.weekly_look_back(now)
+        message = await channel.send(embed=embed)
+        name = f"📝 今週の振り返り（{week_start:%m/%d}〜{now - timedelta(days=1):%m/%d}）"
+        try:
+            thread = await message.create_thread(name=name, auto_archive_duration=10080)
+        except discord.Forbidden:
+            await channel.send(
+                "⚠️ スレッドを作る権限がないため、振り返りスレッドを作れませんでした。"
+                "Bot に「公開スレッドの作成」「スレッドでメッセージを送信」の権限を付けてください（README の手順 1-3）。"
+            )
+            return
+        await thread.send(
+            "今週の売買や、監視していて気づいたことを自由に書き込んでください。\n"
+            "例: なぜその銘柄を買った（見送った）か、うまくいったこと・次に気をつけたいこと"
+        )
+        await db.log_notification("thread", detail=week_start.date().isoformat())
 
     async def run_cleanup(self) -> None:
         candidates = await watchlist.cleanup_candidates(market.now_jst())

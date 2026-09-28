@@ -143,6 +143,23 @@ def _was_restated(stored: dict[date, float], fetched: pd.DataFrame, last_stored:
     return False
 
 
+def _download_groups(coverage: dict[str, date]) -> dict[date, list[str]]:
+    """差分取得の開始日ごとに、まとめてダウンロードする銘柄を分ける。
+
+    保存済みの最新日が新しい銘柄（最も新しい銘柄から RECENT_OVERLAP_DAYS 以内）は、まとめて同じ開始日から取る。
+    それより古い銘柄（売買停止・上場廃止など）は、自分の最新日から別に取る。1 銘柄が古いだけで、
+    全銘柄を何か月分も取り直すことにならないようにするため。
+    """
+    latest = max(coverage.values())
+    overlap = timedelta(days=RECENT_OVERLAP_DAYS)
+    fresh = [c for c, d in coverage.items() if d >= latest - overlap]
+    groups: dict[date, list[str]] = {min(coverage[c] for c in fresh) - overlap: fresh}
+    for c, d in coverage.items():
+        if d < latest - overlap:
+            groups.setdefault(d - overlap, []).append(c)
+    return groups
+
+
 async def get_daily(codes: list[str], years: int = 2, refresh: bool = True) -> dict[str, pd.DataFrame]:
     """codes の日足を、直近 years 年分返す。
 
@@ -163,8 +180,11 @@ async def get_daily(codes: list[str], years: int = 2, refresh: bool = True) -> d
             await db.upsert_prices(_to_rows(code, df))
 
     if stored_codes:
-        since = min(coverage[c] for c in stored_codes) - timedelta(days=RECENT_OVERLAP_DAYS)
-        recent = await asyncio.to_thread(_download_sync, stored_codes, start=since)
+        recent: dict[str, pd.DataFrame] = {}
+        groups = _download_groups({c: coverage[c] for c in stored_codes})
+        for start, group in sorted(groups.items()):
+            recent.update(await asyncio.to_thread(_download_sync, group, start=start))
+        since = min(groups)
         stored: dict[str, dict[date, float]] = {}
         for r in await db.load_prices(list(recent), since):
             stored.setdefault(r["ticker"], {})[r["date"]] = r["close"]

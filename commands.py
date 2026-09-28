@@ -1,4 +1,4 @@
-"""スラッシュコマンド: /settings, /watch add|remove|list|memo|star|tag, /alert add|list|remove, /buy, /sell, /portfolio, /orders, /battle, /deposit, /reset, /chart, /ranking, /compare, /related, /review, /test proposal|signal|report"""
+"""スラッシュコマンド: /settings, /watch add|remove|list|memo|star|tag, /alert add|list|remove, /buy, /sell, /portfolio, /orders, /battle, /deposit, /reset, /chart, /ranking, /compare, /related, /map, /review, /test proposal|signal|report"""
 
 from __future__ import annotations
 
@@ -620,6 +620,45 @@ async def related_command(
     await _run(interaction, private, body)
 
 
+MAP_NEIGHBORS = 4  # 関係図で、1 銘柄あたりに出す関連企業の数
+MAP_PRIMARY = 10  # 関係図に出す監視・保有銘柄の数
+
+
+@app_commands.command(name="map", description="監視銘柄・保有銘柄と、その関連企業のつながりを図にします")
+@app_commands.describe(private=PRIVATE_DESC)
+@app_commands.default_permissions(manage_guild=True)
+async def map_command(interaction: discord.Interaction, private: bool = False) -> None:
+    async def body():
+        client = interaction.client
+        codes = [s["ticker"] for s in await db.list_monitored()] + [p["ticker"] for p in await db.vp_positions("you")]
+        primary = {c: client.master.get(c).name for c in dict.fromkeys(codes) if client.master.get(c)}
+        primary = dict(list(primary.items())[:MAP_PRIMARY])
+        if not primary:
+            raise CommandError("監視銘柄・保有銘柄がありません。`/watch add` や `/buy` で追加すると、関係図を作れます。")
+        others, edges = {}, []
+        for code, name in primary.items():
+            related = [r for r in client.relations.neighbors(code, name) if client.master.get(r.code)]
+            for r in related[:MAP_NEIGHBORS]:
+                edges.append((code, r.code, r.priority))
+                if r.code not in primary:
+                    others[r.code] = client.master.get(r.code).name
+            # 監視・保有銘柄どうしの関係は、上の件数に関係なく描く
+            edges += [(code, r.code, r.priority) for r in related[MAP_NEIGHBORS:] if r.code in primary]
+        if not edges:
+            raise CommandError("関係データに、監視銘柄・保有銘柄と上場企業との関係は見つかりませんでした。")
+        png = await asyncio.to_thread(charts.relation_map, primary, others, edges)
+        embed = discord.Embed(
+            title="🕸️ 監視・保有銘柄と関連企業の関係図",
+            description=f"監視・保有銘柄 {len(primary)} 社と、それぞれ業績への影響が大きい関連企業を {MAP_NEIGHBORS} 社まで描いています。",
+            color=discord.Color.teal(),
+        )
+        embed.set_image(url="attachment://map.png")
+        embed.set_footer(text="関係データ: JP Market Vis（EDINET 等から自動抽出。誤りを含む場合があります）")
+        return {"embed": embed, "file": discord.File(png, filename="map.png")}
+
+    await _run(interaction, private, body)
+
+
 def setup(tree: app_commands.CommandTree) -> None:
     tree.add_command(settings_command)
     tree.add_command(WatchGroup())
@@ -636,4 +675,5 @@ def setup(tree: app_commands.CommandTree) -> None:
     tree.add_command(ranking_command)
     tree.add_command(compare_command)
     tree.add_command(related_command)
+    tree.add_command(map_command)
     tree.add_command(review_command)

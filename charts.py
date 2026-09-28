@@ -2,12 +2,14 @@
 
 画像1: ローソク足＋移動平均 3 本 / RSI / MACD（ヒストグラム付き）
 画像2: 5分足・日足・週足・月足の 2×2 マルチ時間軸チャート
+ほかに、2 銘柄の比較チャートと、監視銘柄と関連企業の関係図（/compare・/map）
 """
 
 from __future__ import annotations
 
 import io
 import logging
+import math
 
 import matplotlib
 
@@ -15,6 +17,7 @@ matplotlib.use("Agg")  # 画面のないサーバー環境用
 
 import matplotlib.pyplot as plt  # noqa: E402
 import mplfinance as mpf  # noqa: E402
+import networkx as nx  # noqa: E402
 import pandas as pd  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 
@@ -207,4 +210,71 @@ def compare_chart(
     ax.legend(loc="upper left", frameon=False, prop={"family": FONT_FAMILY, "size": 10})
     ax.margins(x=0.06)
     fig.autofmt_xdate()
+    return _to_png(fig)
+
+
+EDGE_STYLES = {1: (2.6, TEXT), 2: (1.8, MUTED), 3: (1.1, MUTED), 4: (0.8, GRID)}  # 関係の優先度ごとの (線の太さ, 色)
+
+
+def _component_layout(graph: nx.Graph) -> dict[str, tuple[float, float]]:
+    """つながっている会社のまとまりごとに配置し、まとまりを格子状に並べる（離れたまとまりが端に飛ばないように）。"""
+    comps = sorted(nx.connected_components(graph), key=lambda c: (-len(c), min(c)))
+    cols = max(1, math.ceil(math.sqrt(len(comps))))
+    pos: dict[str, tuple[float, float]] = {}
+    for i, comp in enumerate(comps):
+        sub = graph.subgraph(comp)
+        if len(comp) == 1:
+            local = {next(iter(comp)): (0.0, 0.0)}
+        else:
+            # 見た目がいつも同じになるよう、配置の乱数を固定する
+            local = nx.spring_layout(sub, seed=7, k=1.2 / math.sqrt(len(comp)), iterations=300)
+        cx, cy = (i % cols) * 2.8, -(i // cols) * 2.8
+        for node, (x, y) in local.items():
+            pos[node] = (cx + float(x), cy + float(y))
+    return pos
+
+
+def relation_map(primary: dict[str, str], others: dict[str, str], edges: list[tuple[str, str, int]]) -> io.BytesIO:
+    """監視・保有銘柄（primary）と関連企業（others）の関係図。edges は (証券コード, 証券コード, 優先度)。"""
+    graph = nx.Graph()
+    graph.add_nodes_from([*primary, *others])
+    for a, b, priority in edges:
+        if not graph.has_edge(a, b) or priority < graph[a][b]["priority"]:
+            graph.add_edge(a, b, priority=priority)
+    pos = _component_layout(graph)
+
+    with plt.rc_context({"font.family": FONT_FAMILY}):
+        fig, ax = plt.subplots(figsize=(12, 9))
+        fig.patch.set_facecolor(SURFACE)
+        ax.set_facecolor(SURFACE)
+        ax.axis("off")
+        for priority, (width, color) in EDGE_STYLES.items():
+            chosen = [(a, b) for a, b, d in graph.edges(data=True) if d["priority"] == priority]
+            nx.draw_networkx_edges(graph, pos, edgelist=chosen, width=width, edge_color=color, ax=ax)
+        nx.draw_networkx_nodes(graph, pos, nodelist=list(others), node_size=220, node_color=GRID, edgecolors=MUTED, ax=ax)
+        nx.draw_networkx_nodes(
+            graph, pos, nodelist=list(primary), node_size=700, node_color=MA_COLORS["MA25"], edgecolors=TEXT, ax=ax
+        )
+        # 名前は丸の下に書く（丸や線と重ならないように、背景を付ける）
+        for code, (x, y) in pos.items():
+            is_primary = code in primary
+            name = (primary if is_primary else others)[code]
+            ax.text(
+                x, y - (0.2 if is_primary else 0.14), f"{name[:12]}\n{code}",
+                ha="center", va="top", fontsize=10 if is_primary else 8, color=TEXT if is_primary else MUTED,
+                bbox={"boxstyle": "round,pad=0.15", "facecolor": SURFACE, "edgecolor": "none", "alpha": 0.8},
+            )
+        xs, ys = zip(*pos.values())
+        ax.set_xlim(min(xs) - 0.6, max(xs) + 0.6)
+        ax.set_ylim(min(ys) - 0.7, max(ys) + 0.4)
+        handles = [
+            Line2D([], [], color=MA_COLORS["MA25"], marker="o", linestyle="", markersize=12, label="監視・保有銘柄"),
+            Line2D([], [], color=GRID, marker="o", markeredgecolor=MUTED, linestyle="", markersize=9, label="関連企業"),
+            Line2D([], [], color=TEXT, linewidth=2.6, label="主要取引先・親子会社"),
+            Line2D([], [], color=MUTED, linewidth=1.8, label="資本関係・資本業務提携"),
+            Line2D([], [], color=MUTED, linewidth=1.1, label="業務提携・技術・共同研究"),
+            Line2D([], [], color=GRID, linewidth=0.8, label="取引先・製品導入"),
+        ]
+        ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.0), ncol=3, frameon=False, fontsize=9)
+        ax.set_title("監視・保有銘柄と関連企業の関係図", fontsize=14, color=TEXT, loc="left")
     return _to_png(fig)

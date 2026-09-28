@@ -182,6 +182,12 @@ CREATE TABLE IF NOT EXISTS news_judgements (
     judged_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (ticker, news_url)
 );
+-- 決算日（EDINET コードリスト）。配当・株主優待の権利付き最終日の計算に使う
+CREATE TABLE IF NOT EXISTS fiscal_ends (
+    code       TEXT PRIMARY KEY,
+    fiscal_end TEXT NOT NULL,  -- 例: 3月31日
+    fetched_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 -- 銘柄当てクイズ（取引日の昼に出題し、次の出題のときに答えを発表する）
 CREATE TABLE IF NOT EXISTS quizzes (
     id          BIGSERIAL PRIMARY KEY,
@@ -242,6 +248,7 @@ ALTER TABLE notification_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ai_decisions     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE news_judgements  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE quizzes          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fiscal_ends      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE quiz_answers     ENABLE ROW LEVEL SECURITY;
 """
 
@@ -768,6 +775,34 @@ async def judgements(ticker: str, since: datetime) -> list[dict[str, Any]]:
                 "SELECT * FROM news_judgements WHERE ticker = %s AND judged_at >= %s ORDER BY judged_at", (ticker, since)
             )
         ).fetchall()
+
+
+# ---------------------------------------------------------------- fiscal_ends
+
+
+async def fiscal_ends_fetched_at() -> datetime | None:
+    async with _pool_or_raise().connection() as conn:
+        return (await (await conn.execute("SELECT min(fetched_at) AS t FROM fiscal_ends")).fetchone())["t"]
+
+
+async def replace_fiscal_ends(ends: dict[str, str]) -> None:
+    now = datetime.now(timezone.utc)
+    async with _pool_or_raise().connection() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM fiscal_ends")
+            async with conn.cursor() as cur:
+                await cur.executemany(
+                    "INSERT INTO fiscal_ends (code, fiscal_end, fetched_at) VALUES (%s, %s, %s)",
+                    [(code, end, now) for code, end in ends.items()],
+                )
+
+
+async def load_fiscal_ends(codes: list[str]) -> dict[str, str]:
+    async with _pool_or_raise().connection() as conn:
+        rows = await (
+            await conn.execute("SELECT code, fiscal_end FROM fiscal_ends WHERE code = ANY(%s)", (codes,))
+        ).fetchall()
+    return {r["code"]: r["fiscal_end"] for r in rows}
 
 
 # ---------------------------------------------------------------- quizzes

@@ -24,6 +24,7 @@ import battle
 import charts
 import commands
 import db
+import fiscal
 import market
 import news
 import orders
@@ -182,6 +183,8 @@ class StockBot(ext_commands.Bot):
         self._deposit_lock = asyncio.Lock()
         self._alert_lock = asyncio.Lock()
         self._hot_lock = asyncio.Lock()
+        self._fiscal_lock = asyncio.Lock()
+        self._fiscal_checked: datetime | None = None
         self._background: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------ 起動・終了
@@ -317,6 +320,11 @@ class StockBot(ext_commands.Bot):
             if slot and slot != settings.get(key):
                 await db.set_setting(key, slot)
                 self._spawn(self._guarded(self._report_lock, self.run_report, kind))
+
+        # 決算日（権利付き最終日の計算用）は 7 日ごとに EDINET から取り直す。確認は 1 時間に 1 回まで
+        if not self._fiscal_lock.locked() and (self._fiscal_checked is None or now - self._fiscal_checked > timedelta(hours=1)):
+            self._fiscal_checked = now
+            self._spawn(self._guarded(self._fiscal_lock, self.refresh_fiscal_ends))
 
         # 関係データは起動直後（DB キャッシュからの読み込み）と、7 日ごとの再取得をここで行う
         if self.relations.is_stale() and not self._relations_lock.locked():
@@ -635,6 +643,15 @@ class StockBot(ext_commands.Bot):
             mention = f"<@{a['created_by']}>" if a["created_by"] else None
             await channel.send(content=mention, embed=embed, view=views.decided_view(a["ticker"]))
             await db.log_notification("alert", a["ticker"], f"{a['target']:.1f}")
+
+    async def refresh_fiscal_ends(self) -> None:
+        if not db.is_stale(await db.fiscal_ends_fetched_at()):
+            return
+        ends = await fiscal.download()
+        if len(ends) < 1000:  # 形式の変更などで取れなかったときは、古いキャッシュを残す
+            raise RuntimeError(f"決算日の件数が少なすぎます（{len(ends)} 件）")
+        await db.replace_fiscal_ends(ends)
+        log.info("決算日（EDINET コードリスト）を更新しました (%d 社)", len(ends))
 
     async def run_hot_job(self) -> None:
         """直近に提案した銘柄（監視していないもの）のうち、今日大きく動いた銘柄を 1 日 1 回だけ知らせる。"""

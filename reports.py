@@ -13,9 +13,10 @@ import pandas as pd
 
 import battle
 import db
+import fiscal
+import glossary
 import market
 import portfolio
-import glossary
 import review
 import signals
 from jev_client import CATEGORIES
@@ -163,12 +164,28 @@ async def morning(now: datetime) -> discord.Embed:
 
     if years_ago := await _years_ago(watch, names, now):
         embed.add_field(name="📅 〇年前の今日と比べると", value=years_ago, inline=False)
+    if rights := await _rights_lines(watch, names, now):
+        embed.add_field(name="🗓️ 権利付き最終日が近い銘柄（配当・優待の権利確定日の目安）", value=rights, inline=False)
     term, meaning = glossary.term_of_day(now.date())
     embed.add_field(name=f"📖 今日の用語: {term}", value=meaning, inline=False)
 
     proposals = await db.list_pending_since(_day_start(now))
     embed.set_footer(text=f"今朝の提案 {len(proposals)} 件 ・ 株価は前営業日の終値")
     return embed
+
+
+async def _rights_lines(watch: list[str], names: dict[str, str], now: datetime) -> str | None:
+    """監視・保有銘柄のうち、権利付き最終日が 10 営業日以内の銘柄。"""
+    _, held, _ = await _targets()
+    rows = await fiscal.upcoming(list(dict.fromkeys([*watch, *held])), now.date())
+    lines = [
+        f"・{names.get(code, code)} ({code}): {label}（{record:%m/%d}）→ 権利付き最終日 **{cum:%m/%d}**"
+        + ("（今日）" if left == 0 else f"（あと {left} 営業日）")
+        for code, label, record, cum, left in rows[:MAX_LIST]
+    ]
+    if not lines:
+        return None
+    return "\n".join(lines) + "\n※ 決算日から計算した目安。配当・優待を出すか、中間配当があるかは会社の発表を確かめてください"
 
 
 YEARS_AGO = (1, 5)

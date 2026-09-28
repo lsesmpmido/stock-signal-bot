@@ -235,6 +235,18 @@ async def close(now: datetime) -> discord.Embed:
     return embed
 
 
+BIG_MOVE = 0.03  # 大引けレポートで「なぜ動いた？」ボタンを付ける値動き
+
+
+async def big_movers() -> list[tuple[str, str, float]]:
+    """監視銘柄・保有銘柄のうち、今日 ±3% 以上動いた銘柄（動きの大きい順）。"""
+    watch, held, names = await _targets()
+    tickers = list(dict.fromkeys([*watch, *held]))
+    daily = await market.get_daily(tickers, refresh=False) if tickers else {}
+    moves = [m for m in _moves(tickers, names, daily, _last_change) if abs(m.change) >= BIG_MOVE]
+    return [(m.ticker, m.name, m.change) for m in sorted(moves, key=lambda m: abs(m.change), reverse=True)]
+
+
 SEED_DAYS = 5  # 関連銘柄の提案から、この営業日数まで値動きを追う
 
 

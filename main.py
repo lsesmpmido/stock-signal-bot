@@ -174,6 +174,7 @@ class StockBot(ext_commands.Bot):
             views.SkipPendingButton,
             views.UnwatchButton,
             views.VirtualBuyButton,
+            views.WhyButton,
             views.DepositButton,
             views.PruneButton,
         )
@@ -315,7 +316,10 @@ class StockBot(ext_commands.Bot):
                     embed.add_field(name="🧩 意外なつながり", value=link[:1024], inline=False)
             except Exception:  # おまけの欄なので、失敗してもレポートは送る
                 log.exception("意外なつながりの作成に失敗しました")
-        await (await self._report_channel()).send(embed=embed)
+        view = None
+        if kind == "close":
+            view = views.movers_view(await reports.big_movers())
+        await (await self._report_channel()).send(embed=embed, view=view)
         await db.log_notification("report", detail=kind)
 
     # ------------------------------------------------------------ 銘柄一覧の同期

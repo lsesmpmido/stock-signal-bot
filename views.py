@@ -18,6 +18,7 @@ import db
 import ai_trader
 import battle
 import market
+import news
 import orders
 import portfolio
 import review
@@ -98,6 +99,17 @@ def signal_view(code: str) -> discord.ui.View:
     view = link_view(code)
     view.add_item(UnwatchButton(code))
     view.add_item(VirtualBuyButton(code))
+    view.add_item(WhyButton(code))
+    return view
+
+
+def movers_view(moves: list) -> discord.ui.View | None:
+    """大きく動いた銘柄の「なぜ動いた？」ボタン（大引けレポート用）。moves は (証券コード, 銘柄名, 騰落率)。"""
+    if not moves:
+        return None
+    view = discord.ui.View(timeout=None)
+    for code, name, change in moves[:5]:
+        view.add_item(WhyButton(code, f"🔍 {name[:20]} {change:+.0%}"))
     return view
 
 
@@ -198,6 +210,43 @@ class UnwatchButton(discord.ui.DynamicItem[discord.ui.Button], template=r"watch:
         else:
             msg = f"{self.code} はすでに監視対象ではありません。"
         await interaction.followup.send(msg, ephemeral=True)
+
+
+class WhyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"why:(?P<code>[0-9A-Z]+)"):
+    """「なぜ動いた？」: その銘柄の直近 2 日のニュースを社名で検索して、押した人にだけ見せる。"""
+
+    def __init__(self, code: str, label: str = "🔍 なぜ動いた？") -> None:
+        super().__init__(
+            discord.ui.Button(label=label[:80], style=discord.ButtonStyle.secondary, custom_id=f"why:{code}", row=2)
+        )
+        self.code = code
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match) -> Any:
+        return cls(match["code"], item.label or "🔍 なぜ動いた？")
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        name = await company_name(interaction.client, self.code)
+        try:
+            items = await news.search_company(name)
+        except Exception as exc:
+            await interaction.followup.send(f"⚠️ ニュースを検索できませんでした: `{exc}`", ephemeral=True)
+            raise
+        df = (await market.get_daily([self.code], refresh=False)).get(self.code)
+        move = ""
+        if df is not None and len(df) >= 2:
+            change = df["Close"].iloc[-1] / df["Close"].iloc[-2] - 1
+            move = f"（{df.index[-1]:%m/%d} {change:+.1%}）"
+        embed = discord.Embed(title=f"🔍 {name} ({self.code}) はなぜ動いた？{move}", color=discord.Color.blurple())
+        if items:
+            embed.description = "\n".join(
+                f"・[{i.title}]({i.url})" + (f" — {i.source}" if i.source else "") for i in items
+            )[:4000]
+        else:
+            embed.description = "直近 2 日に、この社名のニュースは見つかりませんでした（市場全体の動きかもしれません）。"
+        embed.set_footer(text="Google News で社名を検索した直近 2 日の記事。値動きとの関係は記事を見て確かめてください")
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class VirtualBuyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"vp:buy:(?P<code>[0-9A-Z]+)"):

@@ -301,9 +301,13 @@ async def buy_command(interaction: discord.Interaction, code: str, amount: float
     code = normalize_code(code)
     await interaction.response.defer(thinking=True)
     try:
-        if not interaction.client.master.get(code) and not CODE_PATTERN.fullmatch(code):
+        if info := interaction.client.master.get(code):
+            name = info.name
+        elif not CODE_PATTERN.fullmatch(code):
             raise portfolio.TradeError(f"`{code}` は証券コードの形式ではありません。")
-        name = await views.company_name(interaction.client, code)
+        # JPX の一覧にない（新規上場など）なら株価データで上場を確かめる。見つからないコードの注文は受け付けない
+        elif (name := await market.lookup_listed_name(code)) is None:
+            raise portfolio.TradeError(f"証券コード `{code}` の上場銘柄は見つかりませんでした。")
         yen = amount * 10_000 if amount is not None else await portfolio.default_amount()
         if yen <= 0:
             raise portfolio.TradeError("購入金額は 0 より大きくしてください。")

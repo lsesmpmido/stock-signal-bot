@@ -241,7 +241,8 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
     positions = [p for p in await db.vp_positions(OWNER) if p["ticker"] not in pending_sells]
     candidates = await _collect_candidates(now)
     tickers = sorted({p["ticker"] for p in positions} | set(candidates))
-    your_buys = [t["ticker"] for t in await db.vp_trades("you") if t["side"] == "buy"]
+    # 自分が過去に買った銘柄の日足は、弟子モードで自分の買い方を調べるときだけ使う
+    your_buys = [t["ticker"] for t in await db.vp_trades("you") if t["side"] == "buy"] if mode.follow_you else []
     daily = await market.get_daily(sorted(set(tickers) | set(your_buys)), refresh=False) if tickers else {}
 
     # ---- 保有の見直し

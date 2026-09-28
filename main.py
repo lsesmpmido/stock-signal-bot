@@ -452,11 +452,14 @@ class StockBot(ext_commands.Bot):
     # ------------------------------------------------------------ 株価の保存（大引け後）
 
     async def run_price_sync_job(self) -> None:
-        """監視銘柄・直近の提案銘柄・指数の確定した日足を DB に保存し、古い日足を削除する。"""
+        """監視銘柄・直近の提案銘柄・仮想の保有銘柄・AI の候補・指数の確定した日足を DB に保存し、古い日足を削除する。"""
         codes = [s["ticker"] for s in await db.list_monitored()]
         codes += sorted(await db.recently_proposed_tickers(PRICE_SYNC_PROPOSAL_DAYS))
         for owner in portfolio.OWNER_LABELS:
             codes += [p["ticker"] for p in await db.vp_positions(owner)]
+        # 自分が最近買った銘柄は、売った後も AI の候補に残る。AI はこの後の判断で保存済みの日足を使うので、ここで最新にしておく
+        since = market.now_jst() - timedelta(days=ai_trader.YOUR_BUY_WINDOW * 2)
+        codes += [t["ticker"] for t in await db.vp_trades("you", since) if t["side"] == "buy"]
         codes += list(market.INDEX_CODES)
         daily = await market.get_daily(codes)
         pruned = await market.prune_old_prices()

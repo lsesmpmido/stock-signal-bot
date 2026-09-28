@@ -18,6 +18,7 @@ import portfolio
 import glossary
 import review
 import signals
+from jev_client import CATEGORIES
 from market import JST
 
 INDEX_LABELS = {"^N225": "日経平均", "1306": "TOPIX（連動ETF）"}
@@ -25,7 +26,7 @@ MAX_LIST = 10
 RSI_NEAR = 5  # RSI がしきい値（30 / 70）まであとこの幅以内なら「接近」
 MA_NEAR = 0.01  # 25 日線と 75 日線の差がこの割合以内なら「接近」
 MACD_NEAR = 0.1  # MACD とシグナル線の差が、直近 60 日の平均的な差のこの割合以内なら「接近」
-KIND_LABELS = {"proposal": "提案", "signal": "売買シグナル", "delist": "自動解除", "report": "レポート", "fill": "約定", "ai_trade": "AIの売買", "deposit": "追加入金", "alert": "価格アラート", "cleanup": "整理タイム", "reset": "勝負のやり直し", "ai_decisions": "AIの判断"}
+KIND_LABELS = {"proposal": "提案", "signal": "売買シグナル", "delist": "自動解除", "report": "レポート", "fill": "約定", "ai_trade": "AIの売買", "deposit": "追加入金", "alert": "価格アラート", "cleanup": "整理タイム", "reset": "勝負のやり直し", "ai_decisions": "AIの判断", "pick": "今日の1銘柄", "hot": "話題銘柄の急騰・急落"}
 
 
 @dataclass(frozen=True)
@@ -368,6 +369,35 @@ async def surprising_link(master, relations, now: datetime) -> str | None:
         f"{b_info.name} ({b})〔{b_info.sector}〕は、{a_info.name} ({a})〔{a_info.sector}〕の{link.label}"
         + ("\n（あなたの監視・保有銘柄のつながりから）" if mine else "")
     )
+
+
+PICK_PROPOSAL_DAYS = 7
+
+
+async def stock_of_day(master, relations, now: datetime):
+    """今日の 1 銘柄: 監視も保有もしていない銘柄から 1 社を選ぶ（直近の提案でインパクトの高いものを優先し、
+    なければ監視・保有銘柄の関連企業から日替わりで）。(証券コード, 銘柄名, 紹介の理由) か None。"""
+    watch, held, _ = await _targets()
+    mine = set(watch) | set(held)
+    proposals = [
+        p for p in await db.list_pending_since(now - timedelta(days=PICK_PROPOSAL_DAYS)) if p["ticker"] not in mine
+    ]
+    if proposals:
+        p = max(proposals, key=lambda p: (p["impact"] or 0, p["score"] or 0))
+        category = _category_label(p.get("category"))
+        return p["ticker"], p["company_name"], f"{p['created_at'].astimezone(JST):%m/%d} の提案{category}: {p['news_title']}"
+    related = []
+    for c in dict.fromkeys([*watch, *held]):
+        if info := master.get(c):
+            related += [(r, info) for r in relations.neighbors(c, info.name) if r.code not in mine and master.get(r.code)]
+    if not related:
+        return None
+    r, origin = related[now.date().toordinal() % len(related)]
+    return r.code, master.get(r.code).name, f"あなたの監視・保有銘柄 {origin.name} の{r.label}"
+
+
+def _category_label(category: str | None) -> str:
+    return f"（{CATEGORIES[category][0]}）" if category in CATEGORIES else ""
 
 
 BUILDERS = {"morning": morning, "close": close, "weekly": weekly}

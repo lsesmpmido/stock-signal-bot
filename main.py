@@ -102,6 +102,16 @@ def fill_slots(day: datetime) -> list[datetime]:
     return [datetime.combine(day.date(), t, JST) for t in FILL_TIMES]
 
 
+# 話題銘柄（直近に提案した銘柄）の急騰・急落を調べる時刻。昼休み（後場の株価が届く前）は除く
+HOT_TIMES = [time(10, 0), time(11, 0), time(13, 0), time(14, 0), time(15, 0)]
+HOT_MOVE = 0.07  # 前日の終値からこれ以上動いたら知らせる
+HOT_PROPOSAL_DAYS = 3
+
+
+def hot_slots(day: datetime) -> list[datetime]:
+    return [datetime.combine(day.date(), t, JST) for t in HOT_TIMES] if market.is_trading_day(day.date()) else []
+
+
 def alert_slots(day: datetime) -> list[datetime]:
     """価格アラートを調べる時刻（取引日の場中、15 分おき）。"""
     return signal_slots("15m", day)
@@ -160,6 +170,7 @@ class StockBot(ext_commands.Bot):
         self._fill_lock = asyncio.Lock()
         self._deposit_lock = asyncio.Lock()
         self._alert_lock = asyncio.Lock()
+        self._hot_lock = asyncio.Lock()
         self._background: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------ 起動・終了
@@ -264,6 +275,16 @@ class StockBot(ext_commands.Bot):
             await db.set_setting("_last_alert_slot", slot)
             self._spawn(self._guarded(self._alert_lock, self.run_alert_job))
 
+        slot = due_slot(hot_slots(now), now)
+        if (
+            settings["proposal_freq"] != "off"
+            and slot
+            and slot != settings.get("_last_hot_slot")
+            and not self._hot_lock.locked()
+        ):
+            await db.set_setting("_last_hot_slot", slot)
+            self._spawn(self._guarded(self._hot_lock, self.run_hot_job))
+
         slot = due_slot(cleanup_slots(now), now)
         if settings.get("report_cleanup", "on") == "on" and slot and slot != settings.get("_last_cleanup_slot"):
             await db.set_setting("_last_cleanup_slot", slot)
@@ -321,8 +342,38 @@ class StockBot(ext_commands.Bot):
         view = None
         if kind == "close":
             view = views.movers_view(await reports.big_movers())
-        await (await self._report_channel()).send(embed=embed, view=view)
+        channel = await self._report_channel()
+        await channel.send(embed=embed, view=view)
+        if kind == "morning":
+            try:
+                await self._send_stock_of_day(channel, now)
+            except Exception:  # おまけのメッセージなので、失敗してもレポートは送れている
+                log.exception("今日の 1 銘柄の作成に失敗しました")
         await db.log_notification("report", detail=kind)
+
+    async def _send_stock_of_day(self, channel, now: datetime) -> None:
+        """今日の 1 銘柄を、チャートと関係の数を添えて紹介する。"""
+        pick = await reports.stock_of_day(self.master, self.relations, now)
+        if pick is None:
+            return
+        code, name, reason = pick
+        df = (await market.get_daily([code], refresh=False)).get(code)
+        if df is None or len(df) < 80:
+            return
+        ind = signals.compute(df)
+        png = await asyncio.to_thread(charts.detailed_chart, code, name, ind)
+        info = self.master.get(code)
+        embed = discord.Embed(title=f"🎁 今日の 1 銘柄: {name} ({code})", description=reason[:4000], color=discord.Color.gold())
+        if info:
+            embed.add_field(name="市場・業種", value=f"{info.market}\n{info.sector}")
+        month = df["Close"].iloc[-1] / df["Close"].iloc[-21] - 1 if len(df) > 20 else None
+        embed.add_field(name="株価", value=f"{df['Close'].iloc[-1]:,.1f} 円" + (f"（1 か月 {month:+.1%}）" if month is not None else ""))
+        embed.add_field(name="関係のある上場企業", value=f"{len(self.relations.neighbors(code, name))} 社（`/related {code}` で表示）")
+        views.add_indicator_fields(embed, ind)
+        embed.set_image(url=f"attachment://{code}_pick.png")
+        embed.set_footer(text="監視も保有もしていない銘柄から選んでいます")
+        await channel.send(embed=embed, file=discord.File(png, filename=f"{code}_pick.png"), view=views.decided_view(code))
+        await db.log_notification("pick", code)
 
     # ------------------------------------------------------------ 銘柄一覧の同期
 
@@ -565,6 +616,44 @@ class StockBot(ext_commands.Bot):
             mention = f"<@{a['created_by']}>" if a["created_by"] else None
             await channel.send(content=mention, embed=embed, view=views.decided_view(a["ticker"]))
             await db.log_notification("alert", a["ticker"], f"{a['target']:.1f}")
+
+    async def run_hot_job(self) -> None:
+        """直近に提案した銘柄（監視していないもの）のうち、今日大きく動いた銘柄を 1 日 1 回だけ知らせる。"""
+        now = market.now_jst()
+        watched = {s["ticker"] for s in await db.list_monitored()}
+        proposals: dict[str, dict] = {}
+        for p in await db.list_pending_since(now - timedelta(days=HOT_PROPOSAL_DAYS)):
+            if p["ticker"] not in watched:
+                proposals[p["ticker"]] = p  # 同じ銘柄は新しい提案を使う
+        if not proposals:
+            return
+        sent = {n["ticker"] for n in await db.notifications_since(reports._day_start(now), "hot")}
+        daily = await market.get_daily(sorted(proposals))
+        channel = None
+        for code, p in proposals.items():
+            df = daily.get(code)
+            if code in sent or df is None or len(df) < 2 or df.index[-1].date() != now.date():
+                continue
+            change = float(df["Close"].iloc[-1] / df["Close"].iloc[-2] - 1)
+            if abs(change) < HOT_MOVE:
+                continue
+            channel = channel or await self._channel("DISCORD_CHANNEL_PROPOSAL")
+            up = change > 0
+            embed = discord.Embed(
+                title=f"{'⚡ 話題銘柄が急騰' if up else '🧊 話題銘柄が急落'}: {p['company_name']} ({code}) {change:+.1%}",
+                description=(
+                    f"今 {df['Close'].iloc[-1]:,.1f} 円（約 20 分遅れ）・前日の終値 {df['Close'].iloc[-2]:,.1f} 円\n"
+                    f"{p['created_at'].astimezone(JST):%m/%d} の提案: {p['news_title']}"
+                )[:4000],
+                color=discord.Color.red() if up else discord.Color.dark_blue(),
+            )
+            if p.get("category") in CATEGORIES:
+                embed.add_field(name="材料の種類", value=CATEGORIES[p["category"]][0])
+            embed.set_footer(text=f"直近 {HOT_PROPOSAL_DAYS} 日に提案した、監視していない銘柄だけを見ています（1 銘柄 1 日 1 回まで）")
+            view = views.decided_view(code)
+            view.add_item(views.WhyButton(code))
+            await channel.send(embed=embed, view=view)
+            await db.log_notification("hot", code, f"{change:+.3f}")
 
     async def run_cleanup(self) -> None:
         candidates = await watchlist.cleanup_candidates(market.now_jst())

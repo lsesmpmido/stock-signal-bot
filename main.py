@@ -32,7 +32,7 @@ import reports
 import signals
 import views
 import watchlist
-from jev_client import JevJudge
+from jev_client import CATEGORIES, JevJudge
 from market import JST
 from relations import RelationGraph
 from ticker_master import TickerMaster
@@ -420,7 +420,7 @@ class StockBot(ext_commands.Bot):
         for item, info, ctx, judgement in results:
             kind = "news" if ctx is None else "related"
             pending_id = await db.add_pending(
-                info.code, info.name, item.title, item.url, judgement.is_positive, judgement.impact, kind
+                info.code, info.name, item.title, item.url, judgement.is_positive, judgement.impact, kind, judgement.category
             )
             if pending_id is None:
                 continue
@@ -440,6 +440,7 @@ class StockBot(ext_commands.Bot):
                     color=discord.Color.teal(),
                 )
                 embed.add_field(name="関係", value=relation, inline=False)
+            embed.add_field(name="材料の種類", value=CATEGORIES[judgement.category][0])
             embed.add_field(name="プラス材料の確率", value=f"{judgement.is_positive:.0%}")
             embed.add_field(name="インパクト", value=f"{judgement.impact:.2f} / 2")
             embed.add_field(name="市場・業種", value=f"{info.market}\n{info.sector}")

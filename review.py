@@ -30,6 +30,7 @@ class Outcome:
     status: str  # added / skipped / pending
     kind: str  # news / related
     impact: float
+    category: str | None  # 材料の種類（記録を始める前の提案は None）
     proposed_at: datetime
     change: float  # 騰落率
     topix: float | None  # 同じ期間の TOPIX 連動 ETF の騰落率
@@ -121,6 +122,7 @@ async def build(days: int = 5) -> Review:
                 status=p["status"],
                 kind=p["kind"],
                 impact=p["impact"] or 0.0,
+                category=p.get("category"),
                 proposed_at=p["created_at"],
                 change=change,
                 topix=_period_change(topix, base_date, target_date),

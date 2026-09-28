@@ -70,6 +70,8 @@ ALTER TABLE monitored_stocks ADD COLUMN IF NOT EXISTS star_user_id BIGINT;
 ALTER TABLE monitored_stocks ADD COLUMN IF NOT EXISTS tag TEXT;
 ALTER TABLE monitored_stocks ADD COLUMN IF NOT EXISTS kept_at TIMESTAMPTZ;
 ALTER TABLE pending_stocks ADD COLUMN IF NOT EXISTS skip_reason TEXT;
+-- 材料の種類（jev_client.CATEGORIES のキー）。これより前の提案は NULL
+ALTER TABLE pending_stocks ADD COLUMN IF NOT EXISTS category TEXT;
 CREATE TABLE IF NOT EXISTS price_alerts (
     id           BIGSERIAL PRIMARY KEY,
     ticker       TEXT NOT NULL,
@@ -293,14 +295,15 @@ async def add_pending(
     score: float,
     impact: float,
     kind: str = "news",
+    category: str | None = None,
 ) -> int | None:
     """提案を保存して id を返す。同じ銘柄×同じ記事が既にあれば None。"""
     async with _pool_or_raise().connection() as conn:
         row = await (
             await conn.execute(
-                "INSERT INTO pending_stocks (ticker, company_name, news_title, news_url, score, impact, kind) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (ticker, news_url) DO NOTHING RETURNING id",
-                (ticker, company_name, news_title, news_url, score, impact, kind),
+                "INSERT INTO pending_stocks (ticker, company_name, news_title, news_url, score, impact, kind, category) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (ticker, news_url) DO NOTHING RETURNING id",
+                (ticker, company_name, news_title, news_url, score, impact, kind, category),
             )
         ).fetchone()
     return row["id"] if row else None

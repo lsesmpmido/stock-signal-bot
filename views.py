@@ -22,6 +22,7 @@ import orders
 import portfolio
 import review
 import watchlist
+from jev_client import CATEGORIES
 from market import JST
 
 log = logging.getLogger(__name__)
@@ -793,6 +794,13 @@ def review_embed(r: review.Review) -> discord.Embed:
         picks.append(f"😢 惜しいスキップ: {o.company_name} ({o.ticker}) {o.change:+.1%}")
     if picks:
         embed.add_field(name="注目の提案", value="\n".join(picks), inline=False)
+    by_category = [
+        text
+        for key, (name, _) in CATEGORIES.items()
+        if (text := row(name, r.group(lambda o, k=key: o.category == k)))
+    ]
+    if by_category:
+        embed.add_field(name="材料の種類ごと（承認・スキップ・未回答すべて）", value="\n".join(by_category), inline=False)
     embed.set_footer(text="基準は提案時点で確定していた直近の終値。未回答は比較から外して参考表示")
     return embed
 

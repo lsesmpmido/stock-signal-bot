@@ -14,7 +14,7 @@ import os
 import sys
 from dataclasses import dataclass
 
-from typesafe_sdk import AsyncTypeSafeClient, Noul, RetryPolicy, Score
+from typesafe_sdk import AsyncTypeSafeClient, Choice, Noul, RetryPolicy, Score
 
 IMPACT_LEVELS = [
     "軽微: 株価への影響はほとんどない",
@@ -23,10 +23,23 @@ IMPACT_LEVELS = [
 ]
 
 
+# 材料の種類（提案の理由として表示し、種類ごとの成績の集計に使う）。キー: (表示名, Jev への説明)
+CATEGORIES = {
+    "earnings": ("📊 業績", "決算発表、業績予想の上方・下方修正、月次の売上など"),
+    "shareholder": ("💴 株主還元", "増配・復配、自社株買い、株主優待の新設・拡充など"),
+    "alliance": ("🤝 提携・M&A", "業務提携・資本提携、買収・合併、子会社化、TOB など"),
+    "order": ("📝 受注・契約", "大型受注、取引の開始、契約の締結など"),
+    "product": ("🚀 新製品・新事業", "新製品・新サービスの発表、新事業への参入、承認の取得など"),
+    "policy": ("🏛️ 政策・市況", "法律・規制・政策の変更、原材料や為替などの市況、業界全体の動きなど"),
+    "other": ("📰 その他", "上のどれにも当てはまらない内容"),
+}
+
+
 @dataclass(frozen=True)
 class Judgement:
     is_positive: float  # 0〜1（1 に近いほどプラス材料）
     impact: float  # 0〜2（IMPACT_LEVELS の番号に対応する期待値）
+    category: str = "other"  # 材料の種類（CATEGORIES のキー）
 
 
 class JevJudge:
@@ -59,9 +72,18 @@ class JevJudge:
                     instructions=f"このニュースが「{company}」の株価に与える影響の大きさは？",
                     criteria=IMPACT_LEVELS,
                 ),
+                "category": Choice(
+                    instructions="このニュースは、どの種類の材料ですか？",
+                    criteria={key: description for key, (_, description) in CATEGORIES.items()},
+                ),
             },
         )
-        return Judgement(result.nouls["is_positive"].noul, result.scores["impact"].score)
+        category = result.choices["category"].choice
+        return Judgement(
+            result.nouls["is_positive"].noul,
+            result.scores["impact"].score,
+            category if category in CATEGORIES else "other",
+        )
 
     async def should_buy(self, state: dict) -> float:
         """AI トレーダー用: この銘柄を翌取引日の寄り付きで買うべきかの確信度（0〜1）。"""
@@ -115,7 +137,7 @@ async def _main() -> None:
     judge = JevJudge()
     try:
         j = await judge.judge(sys.argv[1], "", sys.argv[2])
-        print(f"is_positive={j.is_positive:.2f}  impact={j.impact:.2f}")
+        print(f"is_positive={j.is_positive:.2f}  impact={j.impact:.2f}  category={j.category}")
     finally:
         await judge.aclose()
 

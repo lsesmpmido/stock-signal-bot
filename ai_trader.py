@@ -24,7 +24,7 @@ import orders
 import portfolio
 import review
 import signals
-from jev_client import JevJudge
+from jev_client import CATEGORIES, JevJudge
 from market import JST
 
 log = logging.getLogger(__name__)
@@ -219,6 +219,7 @@ def _news_state(news: dict | None) -> dict | None:
         "headline": news["news_title"],
         "positive_probability": round(news["score"] or 0, 2),
         "impact_0_to_2": round(news["impact"] or 0, 2),
+        "category": CATEGORIES[news["category"]][0].split(" ", 1)[1] if news.get("category") in CATEGORIES else None,
         "kind": "関連銘柄として提案" if news.get("kind") == "related" else "ニュースの当事者",
     }
 

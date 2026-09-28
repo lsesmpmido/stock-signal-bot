@@ -15,6 +15,7 @@ import battle
 import db
 import market
 import portfolio
+import glossary
 import review
 import signals
 from market import JST
@@ -159,9 +160,49 @@ async def morning(now: datetime) -> discord.Embed:
                 near.append(f"・{names.get(t, t)} ({t}): {' / '.join(notes)}")
     embed.add_field(name="シグナルが近い銘柄", value="\n".join(near[:MAX_LIST]) or "なし", inline=False)
 
+    if years_ago := await _years_ago(watch, names, now):
+        embed.add_field(name="📅 〇年前の今日と比べると", value=years_ago, inline=False)
+    term, meaning = glossary.term_of_day(now.date())
+    embed.add_field(name=f"📖 今日の用語: {term}", value=meaning, inline=False)
+
     proposals = await db.list_pending_since(_day_start(now))
     embed.set_footer(text=f"今朝の提案 {len(proposals)} 件 ・ 株価は前営業日の終値")
     return embed
+
+
+YEARS_AGO = (1, 5)
+
+
+def _years_back(d, n: int):
+    """n 年前の同じ日。うるう日（2/29）は 2/28 にする。"""
+    try:
+        return d.replace(year=d.year - n)
+    except ValueError:
+        return d.replace(year=d.year - n, day=28)
+
+
+async def _years_ago(watch: list[str], names: dict[str, str], now: datetime) -> str | None:
+    """監視銘柄の今の株価を、1 年前・5 年前の同じ日（休みならその前の取引日）の終値と比べる。"""
+    if not watch:
+        return None
+    daily = await market.get_daily(watch, years=max(YEARS_AGO) + 1, refresh=False)
+    lines = []
+    for t in watch:
+        df = daily.get(t)
+        if df is None or df.empty:
+            continue
+        parts = []
+        for n in YEARS_AGO:
+            target = _years_back(now.date(), n)
+            # 上場から n 年たっていない銘柄は比べない。5 年分のダウンロードは数日ずれて始まることがあるので 1 週間は許す
+            if df.index[0].date() > target + timedelta(days=7):
+                continue
+            past = df[df.index.date <= target]
+            base = float(past["Close"].iloc[-1] if not past.empty else df["Close"].iloc[0])
+            parts.append(f"{n}年前 {base:,.0f} 円（{df['Close'].iloc[-1] / base - 1:+.0%}）")
+        if parts:
+            lines.append(f"・{names.get(t, t)} ({t}): " + " ・ ".join(parts))
+    return "\n".join(lines[:MAX_LIST]) or None
 
 
 async def close(now: datetime) -> discord.Embed:
@@ -188,8 +229,43 @@ async def close(now: datetime) -> discord.Embed:
         value=f"総資産 {s.total_value:,.0f} 円（前日比 {day_change:+,.0f} 円 / 通算 {s.total_return:+.2%}）",
         inline=True,
     )
+    if seeds := await _related_seeds(now):
+        embed.add_field(name="🔗 連想買いの芽（関連銘柄として提案した銘柄の、その後）", value=seeds, inline=False)
     embed.set_footer(text="株価は今日の終値")
     return embed
+
+
+SEED_DAYS = 5  # 関連銘柄の提案から、この営業日数まで値動きを追う
+
+
+async def _related_seeds(now: datetime) -> str | None:
+    """直近に関連銘柄として提案した銘柄の、提案してからの値動きを、ニュースの当事者の値動きと並べる。"""
+    rows = await db.list_pending_since(now - timedelta(days=SEED_DAYS * 2 + 4))
+    origins = {r["news_url"]: r for r in rows if r["kind"] == "news"}
+    related = [
+        r
+        for r in rows
+        if r["kind"] == "related" and 1 <= market.trading_days_between(r["created_at"].astimezone(JST).date(), now.date()) <= SEED_DAYS
+    ]
+    if not related:
+        return None
+    codes = {r["ticker"] for r in related} | {origins[r["news_url"]]["ticker"] for r in related if r["news_url"] in origins}
+    daily = await market.get_daily(sorted(codes), refresh=False)  # 直近の提案銘柄は 16:00 に日足を保存済み
+    seeds = []
+    for r in related:
+        change = review.change_since(daily.get(r["ticker"]), review.base_cutoff(r["created_at"]))
+        if change is None:
+            continue
+        origin = origins.get(r["news_url"])
+        tail = ""
+        if origin:
+            o_change = review.change_since(daily.get(origin["ticker"]), review.base_cutoff(origin["created_at"]))
+            tail = f" ← {origin['company_name']}のニュース（{origin['created_at'].astimezone(JST):%m/%d}" + (
+                f"・当事者 {o_change:+.1%}）" if o_change is not None else "）"
+            )
+        seeds.append((change, f"{_arrow(change)} {r['company_name']} ({r['ticker']}) {change:+.1%}{tail}"))
+    seeds.sort(key=lambda s: s[0], reverse=True)
+    return "\n".join(text for _, text in seeds[:5])[:1024] or None
 
 
 async def weekly(now: datetime) -> discord.Embed:

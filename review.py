@@ -89,6 +89,16 @@ def _change(df: pd.DataFrame, cutoff: date, days: int) -> tuple[float, date, dat
     return float(target / base - 1), dates[base_idx], dates[base_idx + days]
 
 
+def change_since(df: pd.DataFrame | None, cutoff: date) -> float | None:
+    """cutoff 以前で最新の終値から、直近の終値までの騰落率。"""
+    if df is None:
+        return None
+    before = df[df.index.date <= cutoff]
+    if before.empty or before.index[-1] == df.index[-1]:
+        return None
+    return float(df["Close"].iloc[-1] / before["Close"].iloc[-1] - 1)
+
+
 def _period_change(df: pd.DataFrame | None, start: date, end: date) -> float | None:
     if df is None:
         return None

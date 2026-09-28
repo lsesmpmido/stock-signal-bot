@@ -81,6 +81,9 @@ CREATE TABLE IF NOT EXISTS price_alerts (
     triggered_at TIMESTAMPTZ,
     active       BOOLEAN NOT NULL DEFAULT true
 );
+-- アラートを作った時点の、その日の高値・安値（作る前についた値でアラートが鳴らないようにする）
+ALTER TABLE price_alerts ADD COLUMN IF NOT EXISTS base_high DOUBLE PRECISION;
+ALTER TABLE price_alerts ADD COLUMN IF NOT EXISTS base_low DOUBLE PRECISION;
 CREATE TABLE IF NOT EXISTS user_settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -754,13 +757,22 @@ async def notifications_since(since: datetime, kind: str | None = None) -> list[
 # ---------------------------------------------------------------- price_alerts
 
 
-async def add_alert(ticker: str, company_name: str, target: float, direction: str, created_by: int | None) -> int:
+async def add_alert(
+    ticker: str,
+    company_name: str,
+    target: float,
+    direction: str,
+    created_by: int | None,
+    base_high: float | None = None,
+    base_low: float | None = None,
+) -> int:
+    """base_high・base_low は、作った時点でのその日の高値・安値（その日の株価がまだなければ None）。"""
     async with _pool_or_raise().connection() as conn:
         row = await (
             await conn.execute(
-                "INSERT INTO price_alerts (ticker, company_name, target, direction, created_by) "
-                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                (ticker, company_name, target, direction, created_by),
+                "INSERT INTO price_alerts (ticker, company_name, target, direction, created_by, base_high, base_low) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                (ticker, company_name, target, direction, created_by, base_high, base_low),
             )
         ).fetchone()
     return row["id"]

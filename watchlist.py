@@ -20,17 +20,33 @@ TAG_LABELS = {"long": "長期", "short": "短期", "watch": "様子見"}
 @dataclass(frozen=True)
 class Hit:
     alert: dict
-    price: float  # 条件に達したときの株価（今日の高値または安値）
+    price: float  # 条件に達したときの株価（アラートを作ってからの高値または安値）
+
+
+def _reached_before(a: dict) -> bool:
+    """作った日の、作る前の値動きで、すでに指定価格に達していたか（その日の日足を判定に使えない）。
+
+    作った時点のその日の高値・安値がない（古いアラート）ときも、作った日の日足は使わない。
+    """
+    if a["direction"] == "above":
+        return a.get("base_high") is None or a["base_high"] >= a["target"]
+    return a.get("base_low") is None or a["base_low"] <= a["target"]
 
 
 def check_alerts(alerts: list[dict], daily: dict[str, pd.DataFrame]) -> list[Hit]:
-    """アラートを作った日以降の日足の高値・安値で、指定価格に達したかを調べる。"""
+    """アラートを作った日以降の日足の高値・安値で、指定価格に達したかを調べる。
+
+    作った日の日足には作る前の値動きも含まれるので、作る前に指定価格に達していた日は判定に使わない。
+    """
     hits = []
     for a in alerts:
         df = daily.get(a["ticker"])
         if df is None or df.empty:
             continue
-        since = df[df.index.date >= a["created_at"].astimezone(JST).date()]
+        created_on = a["created_at"].astimezone(JST).date()
+        since = df[df.index.date >= created_on]
+        if _reached_before(a):
+            since = since[since.index.date > created_on]
         if since.empty:
             continue
         if a["direction"] == "above" and since["High"].max() >= a["target"]:

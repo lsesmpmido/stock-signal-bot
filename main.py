@@ -512,7 +512,7 @@ class StockBot(ext_commands.Bot):
             word = "超えました" if a["direction"] == "above" else "割りました"
             embed = discord.Embed(
                 title=f"⏰ {a['company_name']} ({a['ticker']}) が {a['target']:,.1f} 円を{word}",
-                description=f"今日の{'高値' if a['direction'] == 'above' else '安値'} {hit.price:,.1f} 円（約 20 分遅れ）",
+                description=f"アラートを作ってからの{'高値' if a['direction'] == 'above' else '安値'} {hit.price:,.1f} 円（約 20 分遅れ）",
                 color=discord.Color.orange(),
             )
             mention = f"<@{a['created_by']}>" if a["created_by"] else None

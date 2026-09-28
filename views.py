@@ -22,6 +22,7 @@ import news
 import orders
 import portfolio
 import review
+import signals
 import watchlist
 from jev_client import CATEGORIES
 from market import JST
@@ -701,6 +702,20 @@ def related_embed(code: str, name: str, related: list, names: dict[str, str], wa
     embed.description = f"{len(related)} 社（影響の大きい順に表示）" + (f"・ほか {rest} 社" if rest else "") + "\n👀 監視中　💰 仮想で保有中"
     embed.set_footer(text="関係データ: JP Market Vis（EDINET 等から自動抽出。誤りを含む場合があります）")
     return embed
+
+
+def past_signals_text(ind: pd.DataFrame, events: list) -> str | None:
+    """シグナルごとに、この銘柄で過去に同じシグナルが出た回数と、その後の値動き。"""
+    years = max(1, round((ind.index[-1] - ind.index[0]).days / 365))
+    lines = []
+    for e in events:
+        count, stats = signals.past_outcomes(ind, e)
+        if not count:
+            lines.append(f"・{e.label}: 過去 {years} 年で初めて")
+            continue
+        parts = [f"{s.horizon}営業日後 平均 {s.mean:+.1%}（上昇 {s.rises}/{s.count}）" for s in stats]
+        lines.append(f"・{e.label}: 過去 {years} 年で {count} 回 → " + (" ・ ".join(parts) or "まだ評価できる期間がない"))
+    return "\n".join(lines)[:1024] or None
 
 
 TREE_FIRST = 8  # 連想ツリーで、2 段階目をたどる 1 段階目の会社の数

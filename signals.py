@@ -74,6 +74,43 @@ def state_of(ind: pd.DataFrame) -> dict[str, str | None]:
     }
 
 
+def _state_series(ind: pd.DataFrame) -> pd.DataFrame:
+    """足ごとの状態（state_of と同じ分け方）を、全期間まとめて求める。"""
+    rsi = ind["RSI"]
+    rsi_zone = pd.Series("mid", index=ind.index).where(rsi.notna())
+    rsi_zone = rsi_zone.mask(rsi <= RSI_LOW, "low").mask(rsi >= RSI_HIGH, "high")
+
+    def side(a: pd.Series, b: pd.Series) -> pd.Series:
+        return pd.Series("below", index=ind.index).mask(a > b, "above").where(a.notna() & b.notna())
+
+    return pd.DataFrame(
+        {"rsi": rsi_zone, "ma": side(ind["MA25"], ind["MA75"]), "macd": side(ind["MACD"], ind["MACD_signal"])}
+    )
+
+
+@dataclass(frozen=True)
+class PastStats:
+    horizon: int  # 何営業日後か
+    count: int  # 評価できた回数
+    mean: float  # 平均の騰落率
+    rises: int  # 上がった回数
+
+
+def past_outcomes(ind: pd.DataFrame, signal: Signal, horizons: tuple[int, ...] = (5, 20)) -> tuple[int, list[PastStats]]:
+    """同じシグナルが、この期間の過去（最新の足を除く）に出た回数と、その N 営業日後の値動き。"""
+    name, value = next(k for k, v in SIGNALS.items() if v == signal)
+    states = _state_series(ind)[name]
+    prev = states.shift(1)
+    hits = [i for i in range(1, len(ind) - 1) if states.iloc[i] == value and pd.notna(prev.iloc[i]) and prev.iloc[i] != value]
+    close = ind["Close"]
+    stats = []
+    for h in horizons:
+        changes = [close.iloc[i + h] / close.iloc[i] - 1 for i in hits if i + h < len(ind)]
+        if changes:
+            stats.append(PastStats(h, len(changes), float(sum(changes) / len(changes)), sum(c > 0 for c in changes)))
+    return len(hits), stats
+
+
 def detect(prev: dict | None, cur: dict) -> list[Signal]:
     """前回の状態から変化した項目だけをシグナルにする。前回の状態がない（監視開始直後）ときは何も出さない。"""
     if not prev:

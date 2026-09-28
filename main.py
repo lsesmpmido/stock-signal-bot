@@ -718,6 +718,8 @@ class StockBot(ext_commands.Bot):
         else:
             embed.description = "シグナルの有無に関係なく送ったテストです。監視状態は変更していません。"
         views.add_indicator_fields(embed, ind)
+        if events and (past := views.past_signals_text(ind, events)):
+            embed.add_field(name="📚 過去の似た局面（この銘柄で同じシグナルが出た後）", value=past, inline=False)
         return embed
 
 

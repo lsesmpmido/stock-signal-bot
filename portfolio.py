@@ -15,8 +15,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time as _time
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
+
+import pandas as pd
 
 import db
 import market
@@ -302,35 +305,50 @@ async def sell(
         await db.vp_record_trade(
             owner, trade, amount - fee - tax, updated, delete_position=remaining == 0, traded_at=traded_at
         )
-
-        opened = position["opened_at"].astimezone(JST).date()
-        try:
-            topix_change = await _topix_change(opened)
-        except Exception:  # 売却はもう記録したので、比較用の TOPIX が取れなくても売却の結果は返す
-            log.warning("TOPIX の騰落率を取得できませんでした", exc_info=True)
-            topix_change = None
         cash_after, _ = await _settings(owner)
-        return SellResult(
-            owner=owner,
-            ticker=ticker,
-            company_name=position["company_name"],
-            account=position["account"],
-            shares=n,
-            price=price,
-            amount=amount,
-            fee=fee,
-            cost=cost,
-            realized=realized,
-            tax=tax,
-            held_days=(when.astimezone(JST).date() - opened).days,
-            topix_change=topix_change,
-            cash_after=cash_after,
-        )
+
+    # 比較用の TOPIX はダウンロードに時間がかかることがあるので、ロックを外してから取る（ほかの売買を待たせない）
+    opened = position["opened_at"].astimezone(JST).date()
+    try:
+        topix_change = await _topix_change(opened)
+    except Exception:  # 売却はもう記録したので、比較用の TOPIX が取れなくても売却の結果は返す
+        log.warning("TOPIX の騰落率を取得できませんでした", exc_info=True)
+        topix_change = None
+    return SellResult(
+        owner=owner,
+        ticker=ticker,
+        company_name=position["company_name"],
+        account=position["account"],
+        shares=n,
+        price=price,
+        amount=amount,
+        fee=fee,
+        cost=cost,
+        realized=realized,
+        tax=tax,
+        held_days=(when.astimezone(JST).date() - opened).days,
+        topix_change=topix_change,
+        cash_after=cash_after,
+    )
 
 
-async def _topix_change(since: date) -> float | None:
+TOPIX_CACHE_SECONDS = 600
+_topix_cache: tuple[float, pd.DataFrame | None] | None = None  # (取った時刻, 日足)
+
+
+async def _topix_daily(refresh: bool) -> pd.DataFrame | None:
+    """TOPIX 連動 ETF（1306）の日足。取り直すのは 10 分に 1 回まで（まとめて売ったときに毎回ダウンロードしない）。"""
+    global _topix_cache
+    if not refresh:
+        return (await market.get_daily(["1306"], years=6, refresh=False)).get("1306")
+    if _topix_cache is None or _time.monotonic() - _topix_cache[0] > TOPIX_CACHE_SECONDS:
+        _topix_cache = (_time.monotonic(), (await market.get_daily(["1306"], years=6)).get("1306"))
+    return _topix_cache[1]
+
+
+async def _topix_change(since: date, refresh: bool = True) -> float | None:
     """since から直近までの TOPIX 連動 ETF（1306）の騰落率。"""
-    topix = (await market.get_daily(["1306"], years=6)).get("1306")
+    topix = await _topix_daily(refresh)
     if topix is None or topix.empty:
         return None
     before = topix[topix.index.date <= since]
@@ -338,10 +356,11 @@ async def _topix_change(since: date) -> float | None:
     return float(topix["Close"].iloc[-1] / base - 1)
 
 
-async def summary(owner: str) -> Summary:
+async def summary(owner: str, refresh: bool = True) -> Summary:
+    """refresh=False なら、株価をダウンロードし直さず DB に保存済みの日足を使う（大引け後に保存した直後など）。"""
     positions = await db.vp_positions(owner)
     tickers = sorted({p["ticker"] for p in positions})
-    daily = await market.get_daily(tickers) if tickers else {}
+    daily = await market.get_daily(tickers, refresh=refresh) if tickers else {}
     holdings = [
         Holding(
             p["account"],
@@ -367,7 +386,7 @@ async def summary(owner: str) -> Summary:
         year_tax=totals["tax"],
         year_fee=totals["fee"],
         started_at=started_at,
-        topix_change=await _topix_change(started_at.astimezone(JST).date()),
+        topix_change=await _topix_change(started_at.astimezone(JST).date(), refresh),
     )
 
 

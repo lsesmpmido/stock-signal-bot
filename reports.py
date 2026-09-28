@@ -138,7 +138,7 @@ async def _targets() -> tuple[list[str], list[str], dict[str, str]]:
 
 async def morning(now: datetime) -> discord.Embed:
     watch, _, names = await _targets()
-    daily = await market.get_daily([*watch, *market.INDEX_CODES])
+    daily = await market.get_daily([*watch, *market.INDEX_CODES], refresh=False)
     embed = discord.Embed(title=f"🌅 朝のブリーフィング（{now:%m/%d}）", color=discord.Color.gold())
     embed.add_field(name="前日の市場", value=_index_lines(daily, _last_change), inline=False)
 
@@ -167,7 +167,7 @@ async def morning(now: datetime) -> discord.Embed:
 async def close(now: datetime) -> discord.Embed:
     watch, held, names = await _targets()
     tickers = list(dict.fromkeys([*watch, *held]))
-    daily = await market.get_daily([*tickers, *market.INDEX_CODES])
+    daily = await market.get_daily([*tickers, *market.INDEX_CODES], refresh=False)
     embed = discord.Embed(title=f"🔔 大引けレポート（{now:%m/%d}）", color=discord.Color.blue())
     embed.add_field(name="今日の市場", value=_index_lines(daily, _last_change), inline=False)
     embed.add_field(
@@ -177,7 +177,7 @@ async def close(now: datetime) -> discord.Embed:
     signals_today = await db.notifications_since(_day_start(now), "signal")
     embed.add_field(name="今日のシグナル", value=f"{len(signals_today)} 件", inline=True)
 
-    s = await portfolio.summary("you")
+    s = await portfolio.summary("you", refresh=False)
     day_change = 0.0
     for h in s.holdings:
         df = daily.get(h.ticker)
@@ -196,7 +196,7 @@ async def weekly(now: datetime) -> discord.Embed:
     week_start = _week_start(now)
     watch, held, names = await _targets()
     tickers = list(dict.fromkeys([*watch, *held]))
-    daily = await market.get_daily([*tickers, *market.INDEX_CODES])
+    daily = await market.get_daily([*tickers, *market.INDEX_CODES], refresh=False)
 
     def weekly_change(df):
         return _change_since(df, week_start)
@@ -223,7 +223,7 @@ async def weekly(now: datetime) -> discord.Embed:
         review_lines.append(f"⏭️ スキップ {skipped.count} 件 平均 {skipped.change:+.1%}")
     embed.add_field(name="提案の答え合わせ（5営業日後）", value="\n".join(review_lines) + "\n詳しくは `/review`", inline=False)
 
-    s = await portfolio.summary("you")
+    s = await portfolio.summary("you", refresh=False)
     pf = [f"総資産 {s.total_value:,.0f} 円（通算 {s.total_return:+.2%}）"]
     if s.topix_change is not None:
         diff = s.total_return - s.topix_change

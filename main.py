@@ -494,7 +494,7 @@ class StockBot(ext_commands.Bot):
         """両チームの今日の総資産を記録する（AI との勝負の月ごとの勝敗に使う）。"""
         today = market.now_jst().date()
         for owner in portfolio.OWNER_LABELS:
-            s = await portfolio.summary(owner)
+            s = await portfolio.summary(owner, refresh=False)  # 直前の日足の保存で、確定した株価を保存済み
             await db.vp_save_snapshot(owner, today, s.total_value, s.deposits)
 
     # ------------------------------------------------------------ 価格アラート・週末の整理タイム

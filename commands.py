@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import discord
+import pandas as pd
 from discord import app_commands
 
 import battle
@@ -559,10 +560,15 @@ async def compare_command(
         png = await asyncio.to_thread(charts.compare_chart, (c1, n1, d1.tail(bars)), (c2, n2, d2.tail(bars)), label)
         if png is None:
             raise CommandError("2 銘柄に共通する取引日のデータが足りません。")
-        r1, r2 = (float(d.tail(bars)["Close"].iloc[-1] / d.tail(bars)["Close"].iloc[0] - 1) for d in (d1, d2))
+        # チャートと同じく、2 銘柄に共通する最初の日を起点にする（上場して間もない銘柄と比べるとき、期間が短くなる）
+        joined = pd.concat({"a": d1.tail(bars)["Close"], "b": d2.tail(bars)["Close"]}, axis=1).dropna()
+        r1, r2 = (float(joined[col].iloc[-1] / joined[col].iloc[0] - 1) for col in ("a", "b"))
         embed = discord.Embed(
             title=f"⚖️ {n1} ({c1}) vs {n2} ({c2})（{label}）",
-            description=f"{n1}: **{r1:+.2%}**\n{n2}: **{r2:+.2%}**",
+            description=(
+                f"{n1}: **{r1:+.2%}**\n{n2}: **{r2:+.2%}**\n"
+                f"起点 {joined.index[0]:%Y/%m/%d} 〜 {joined.index[-1]:%Y/%m/%d}"
+            ),
             color=discord.Color.blurple(),
         )
         embed.set_image(url="attachment://compare.png")

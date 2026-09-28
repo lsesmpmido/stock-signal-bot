@@ -75,6 +75,10 @@ class WatchGroup(
             return
         if await views.watch_is_full():
             view = await views.ReplaceWatchView.create(code, name, "manual")
+            if interaction.response.is_done():
+                # 公開で「考え中」にした後の最初の送信は、その表示を置き換えるので「自分だけに表示」にできない。
+                # 先に公開の短いお知らせで置き換え、入れ替えのメニューは次の送信で実行した人だけに見せる
+                await send(f"ℹ️ 監視枠がいっぱいのため、{name} ({code}) と入れ替える銘柄を選んでください。")
             await send(await views.replace_prompt(code, name), view=view, ephemeral=True)
             return
         await db.add_monitored(code, name, "manual")

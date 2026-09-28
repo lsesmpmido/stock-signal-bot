@@ -827,19 +827,28 @@ class _ReplaceSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         view: ReplaceWatchView = self.view
+        # メニューを開いている間に、ほかの操作で監視が変わっていることがある。
+        # 先に追加し、追加できたときだけ外す（すでに監視中なら、選んだ銘柄を外さない）
+        if not await db.add_monitored(view.code, view.name, view.source):
+            await interaction.response.edit_message(
+                content=f"ℹ️ {view.name} ({view.code}) はすでに監視中です。入れ替えはしていません。", view=None
+            )
+            return
         removed = await db.remove_monitored(self.values[0])
-        await db.add_monitored(view.code, view.name, view.source)
         if view.pending_id is not None:
             await db.set_pending_status(view.pending_id, "added")
+        # 選んだ銘柄がすでに外れていたら、空いた枠に追加しただけになる
+        swapped = f"（{removed['company_name']} と入れ替え）" if removed else ""
         if view.proposal_message is not None:
-            note = f"✅ {interaction.user.display_name} が監視対象に追加しました（{removed['company_name']} と入れ替え）"
+            note = f"✅ {interaction.user.display_name} が監視対象に追加しました{swapped}"
             await view.proposal_message.edit(
                 embed=_with_footer(view.proposal_message, note), view=decided_view(view.code)
             )
-        await interaction.response.edit_message(
-            content=f"🔁 {removed['company_name']} ({removed['ticker']}) を外して、{view.name} ({view.code}) を追加しました。",
-            view=None,
-        )
+        if removed:
+            text = f"🔁 {removed['company_name']} ({removed['ticker']}) を外して、{view.name} ({view.code}) を追加しました。"
+        else:
+            text = f"👀 {view.name} ({view.code}) を追加しました（選んだ銘柄は、すでに監視から外れていました）。"
+        await interaction.response.edit_message(content=text, view=None)
 
 
 class ReplaceWatchView(discord.ui.View):

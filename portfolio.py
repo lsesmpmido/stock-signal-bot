@@ -5,8 +5,8 @@
 - NISA 枠は売っても同じ年には戻らず、翌年 1 月に 240 万円に戻る
 - 特定口座の売却益には 20.315% の税金がかかる。同じ年の損益は相殺し、損が出たら払い過ぎの税金を戻す
 - 手数料は売買代金 × vp_fee_rate。特定口座では利益から差し引いてから税金を計算する
-- 取引時間中は最新の株価ですぐ約定し、取引時間外は注文として受け付けて翌取引日の始値で約定する
-  （終値を見てから、その終値で売買できないようにするため）
+- 取引時間中は最新の株価ですぐ約定し、取引時間外は注文として受け付けて次の寄り付き（翌取引日の始値。
+  昼休みなら後場の始値）で約定する（見えている株価を見てから、その株価で売買できないようにするため）
 - 監視（通知）とは別の機能で、仮想で買っても監視対象には入らない
 """
 
@@ -30,6 +30,16 @@ ACCOUNT_LABELS = {"nisa": "NISA", "tokutei": "特定口座"}
 OWNER_LABELS = {"you": "あなた", "ai": "AI"}
 MARKET_OPEN = time(9, 0)
 MARKET_CLOSE = time(15, 30)
+LUNCH_START = time(11, 30)  # 前場の終わり
+AFTERNOON_OPEN = time(12, 30)  # 後場の寄り付き
+# 株価は約 20 分遅れるので、後場の株価が取れるのはこの時刻から。それまでは前場の終値しか見えない
+AFTERNOON_LIVE = time(12, 50)
+
+
+def in_live_session(now: datetime) -> bool:
+    """取得できる最新の株価で、すぐ約定させてよい時間帯か（取引日の前場・後場。昼休みと後場の株価が届くまでは除く）。"""
+    t = now.time()
+    return market.is_trading_day(now.date()) and MARKET_OPEN <= t < MARKET_CLOSE and not LUNCH_START <= t < AFTERNOON_LIVE
 
 _lock = asyncio.Lock()  # ボタンの連打や、AI と自分の売買が同時に走らないようにする
 
@@ -162,12 +172,12 @@ async def default_amount() -> float:
 
 
 async def live_price(ticker: str) -> float | None:
-    """取引時間中なら、今日の最新株価（約 20 分遅れ）。取引時間外や今日の株価がまだないときは None。
+    """取引時間中なら、今日の最新株価（約 20 分遅れ）。取引時間外・昼休み・今日の株価がまだないときは None。
 
-    None のときは、注文として受け付けて翌取引日の始値で約定させる。
+    None のときは、注文として受け付けて次の寄り付きの始値で約定させる（orders.fill_open_orders）。
     """
     now = market.now_jst()
-    if not market.is_trading_day(now.date()) or not (MARKET_OPEN <= now.time() < MARKET_CLOSE):
+    if not in_live_session(now):
         return None
     daily = (await market.get_daily([ticker])).get(ticker)
     if daily is None or daily.empty or daily.index[-1].date() != now.date():

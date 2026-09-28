@@ -154,7 +154,7 @@ CREATE TABLE IF NOT EXISTS vp_orders (
     reason       TEXT,
     confidence   DOUBLE PRECISION,
     source       TEXT,  -- AI の買い: 候補に入った理由（proposal / watch / your_holding）
-    status       TEXT NOT NULL DEFAULT 'open',  -- open / filled / failed / cancelled / expired
+    status       TEXT NOT NULL DEFAULT 'open',  -- open / filling（約定の処理中）/ filled / failed / cancelled / expired
     note         TEXT,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     filled_at    TIMESTAMPTZ
@@ -639,13 +639,13 @@ async def vp_orders(status: str = "open", owner: str | None = None) -> list[dict
         return await (await conn.execute(sql, params)).fetchall()
 
 
-async def vp_update_order(order_id: int, status: str, note: str | None = None) -> bool:
-    """注文の状態を変える。未約定（open）の注文だけを対象にし、変えられたら True。"""
+async def vp_update_order(order_id: int, status: str, note: str | None = None, current: str = "open") -> bool:
+    """注文の状態を変える。状態が current（既定は未約定の open）の注文だけを対象にし、変えられたら True。"""
     async with _pool_or_raise().connection() as conn:
         cur = await conn.execute(
             "UPDATE vp_orders SET status = %s, note = %s, filled_at = CASE WHEN %s = 'filled' THEN now() END "
-            "WHERE id = %s AND status = 'open'",
-            (status, note, status, order_id),
+            "WHERE id = %s AND status = %s",
+            (status, note, status, order_id, current),
         )
         return cur.rowcount > 0
 

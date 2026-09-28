@@ -429,7 +429,7 @@ async def intraday_stop_loss(now: datetime) -> list[orders.Executed]:
 
     自分の取引時間中の売買と同じ条件で約定させる。売った後に知らせるので、先回りされる心配はない。
     """
-    if not market.is_trading_day(now.date()) or not (portfolio.MARKET_OPEN <= now.time() < portfolio.MARKET_CLOSE):
+    if not portfolio.in_live_session(now):
         return []
     # 前日の判断で出した売り注文がまだ約定していない銘柄は、その注文に任せる
     pending_sells = {o["ticker"] for o in await db.vp_orders("open", OWNER) if o["side"] == "sell"}

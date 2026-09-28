@@ -247,10 +247,11 @@ def placed_embed(placed: orders.Placed, side: str, code: str, name: str) -> disc
     if placed.result is not None:
         return buy_embed(placed.result) if side == "buy" else sell_embed(placed.result)
     action = "購入" if side == "buy" else "売却"
+    when, why = orders.queued_fill(market.now_jst())
     return discord.Embed(
         title=f"📝 {name} ({code}) の仮想{action}注文を受け付けました",
         description=(
-            "取引時間外のため、翌取引日の始値で約定します（終値を見てから、その終値で売買できないようにするため）。\n"
+            f"{why}、{when}で約定します（見えている株価を見てから、その株価で売買できないようにするため）。\n"
             f"注文番号 {placed.order_id} ・ 取り消しは `/orders`"
         ),
         color=discord.Color.light_grey(),
@@ -331,7 +332,7 @@ def portfolio_embed(s: portfolio.Summary) -> discord.Embed:
 
 def fills_embed(executed: list[orders.Executed], owner: str) -> discord.Embed:
     """取引時間外に出した注文の約定結果をまとめる。"""
-    embed = discord.Embed(title="📝 注文が約定しました（今日の始値）", color=discord.Color.blue())
+    embed = discord.Embed(title="📝 注文が約定しました（寄り付きの始値）", color=discord.Color.blue())
     lines = []
     for e in executed:
         o = e.order
@@ -746,7 +747,7 @@ def orders_embed(open_orders: list[dict]) -> discord.Embed:
     embed.description = "\n".join(
         f"{order_label(o)}（{o['created_at'].astimezone(JST):%m/%d %H:%M} 受付）" for o in open_orders[:25]
     )
-    embed.set_footer(text="翌取引日の始値で約定します")
+    embed.set_footer(text="次の寄り付き（翌取引日の始値。昼休みに出した注文は今日の後場の始値）で約定します")
     return embed
 
 

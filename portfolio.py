@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
@@ -20,6 +21,8 @@ from datetime import date, datetime, time
 import db
 import market
 from market import JST
+
+log = logging.getLogger(__name__)
 
 NISA_ANNUAL_LIMIT = 2_400_000
 TAX_RATE = 0.20315
@@ -275,6 +278,11 @@ async def sell(
         )
 
         opened = position["opened_at"].astimezone(JST).date()
+        try:
+            topix_change = await _topix_change(opened)
+        except Exception:  # 売却はもう記録したので、比較用の TOPIX が取れなくても売却の結果は返す
+            log.warning("TOPIX の騰落率を取得できませんでした", exc_info=True)
+            topix_change = None
         cash_after, _ = await _settings(owner)
         return SellResult(
             owner=owner,
@@ -289,7 +297,7 @@ async def sell(
             realized=realized,
             tax=tax,
             held_days=(when.astimezone(JST).date() - opened).days,
-            topix_change=await _topix_change(opened),
+            topix_change=topix_change,
             cash_after=cash_after,
         )
 

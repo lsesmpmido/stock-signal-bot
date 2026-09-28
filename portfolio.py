@@ -34,6 +34,11 @@ MARKET_CLOSE = time(15, 30)
 _lock = asyncio.Lock()  # ボタンの連打や、AI と自分の売買が同時に走らないようにする
 
 
+def trade_lock() -> asyncio.Lock:
+    """売買と同時に口座を作り直さないよう、初期条件の設定でも同じロックを使う。"""
+    return _lock
+
+
 class TradeError(Exception):
     """利用者に見せるエラー（資金不足・保有なしなど）。"""
 
@@ -140,6 +145,18 @@ async def _settings(owner: str) -> tuple[float, float]:
     return float(s[db.CASH_KEYS[owner]]), float(s["vp_fee_rate"])
 
 
+def nisa_preset(settings: dict[str, str], year: int) -> float:
+    """勝負を始める前に、その年に使っていた NISA 枠（初期条件の設定で登録したもの）。"""
+    preset_year, _, amount = settings.get("vp_nisa_preset", "").partition(":")
+    return float(amount) if preset_year == str(year) and amount else 0.0
+
+
+async def _nisa_left(owner: str, when: datetime) -> float:
+    totals = await db.vp_year_totals(owner, _year_start(when))
+    used = totals["nisa_bought"] + nisa_preset(await db.get_all_settings(), when.year)
+    return max(0.0, NISA_ANNUAL_LIMIT - used)
+
+
 async def default_amount() -> float:
     return float((await db.get_all_settings())["vp_default_amount"])
 
@@ -177,8 +194,7 @@ async def buy(
             raise TradeError(
                 f"1 株も買えません（株価 {price:,.0f} 円、指定額 {amount:,.0f} 円、現金 {cash:,.0f} 円）。"
             )
-        totals = await db.vp_year_totals(owner, _year_start(traded_at or market.now_jst()))
-        nisa_left = max(0.0, NISA_ANNUAL_LIMIT - totals["nisa_bought"])
+        nisa_left = await _nisa_left(owner, traded_at or market.now_jst())
         nisa_shares = min(shares, math.floor(nisa_left / price))
         plan = [("nisa", nisa_shares), ("tokutei", shares - nisa_shares)]
 
@@ -329,14 +345,15 @@ async def summary(owner: str) -> Summary:
         for p in positions
     ]
     settings = await db.get_all_settings()
-    totals = await db.vp_year_totals(owner, _year_start(market.now_jst()))
+    now = market.now_jst()
+    totals = await db.vp_year_totals(owner, _year_start(now))
     started_at = datetime.fromisoformat(settings["vp_started_at"])
     return Summary(
         owner=owner,
         cash=float(settings[db.CASH_KEYS[owner]]),
         deposits=float(settings[db.DEPOSIT_KEYS[owner]]),
         holdings=holdings,
-        nisa_left=max(0.0, NISA_ANNUAL_LIMIT - totals["nisa_bought"]),
+        nisa_left=max(0.0, NISA_ANNUAL_LIMIT - totals["nisa_bought"] - nisa_preset(settings, now.year)),
         year_tax=totals["tax"],
         year_fee=totals["fee"],
         started_at=started_at,

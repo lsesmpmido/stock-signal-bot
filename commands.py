@@ -1,4 +1,4 @@
-"""スラッシュコマンド: /settings, /watch add|remove|list|memo|star|tag, /alert add|list|remove, /buy, /sell, /portfolio, /orders, /battle, /deposit, /chart, /ranking, /compare, /related, /review, /test proposal|signal|report"""
+"""スラッシュコマンド: /settings, /watch add|remove|list|memo|star|tag, /alert add|list|remove, /buy, /sell, /portfolio, /orders, /battle, /deposit, /reset, /chart, /ranking, /compare, /related, /review, /test proposal|signal|report"""
 
 from __future__ import annotations
 
@@ -401,6 +401,12 @@ async def deposit_command(interaction: discord.Interaction, amount: app_commands
     await interaction.response.send_message(f"✅ 次回（1 月 1 日）の追加入金を **{yen:,} 円** にしました。", ephemeral=True)
 
 
+@app_commands.command(name="reset", description="現金・すでに持っている銘柄を指定して、AI との勝負を同じ条件でやり直します")
+@app_commands.default_permissions(manage_guild=True)
+async def reset_command(interaction: discord.Interaction) -> None:
+    await interaction.response.send_modal(views.ResetModal())
+
+
 # ---------------------------------------------------------------- 便利コマンド
 
 
@@ -558,6 +564,7 @@ def setup(tree: app_commands.CommandTree) -> None:
     tree.add_command(orders_command)
     tree.add_command(battle_command)
     tree.add_command(deposit_command)
+    tree.add_command(reset_command)
     tree.add_command(chart_command)
     tree.add_command(ranking_command)
     tree.add_command(compare_command)

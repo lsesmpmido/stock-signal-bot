@@ -449,6 +449,19 @@ class StockBot(ext_commands.Bot):
         except Exception:
             log.exception("AI トレーダーの判断でエラーが発生しました")
 
+    async def run_reset(self, plan: battle.StartPlan, now: datetime) -> bool:
+        """勝負をやり直す。AI の判断（日足保存の後）や注文の約定の途中なら、やり直さずに False を返す。
+
+        途中でやり直すと、やり直す前の保有・現金にもとづく注文や判断が、新しい口座に入ってしまうため。
+        やり直しの間は両方のロックを持ち、スケジューラが同じ時刻にこれらのジョブを始めないようにする
+        （ロック中はその時刻を実行済みにせず、次の tick で改めて始める）。
+        """
+        if self._price_sync_lock.locked() or self._fill_lock.locked():
+            return False
+        async with self._price_sync_lock, self._fill_lock:
+            await battle.apply_start(plan, now)
+        return True
+
     async def current_mode(self) -> ai_trader.Mode:
         return await battle.current_mode()
 

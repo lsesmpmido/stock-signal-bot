@@ -378,6 +378,135 @@ def ai_fills_embed(executed: list[orders.Executed], mode: ai_trader.Mode, now) -
     return embed
 
 
+# ---------------------------------------------------------------- 初期条件の設定（/reset）
+
+
+class ResetModal(discord.ui.Modal, title="AI との勝負をやり直す"):
+    cash = discord.ui.TextInput(label="現金（万円）", placeholder="例: 200", max_length=10)
+    holdings = discord.ui.TextInput(
+        label="すでに持っている銘柄（1 行に 1 銘柄）",
+        style=discord.TextStyle.paragraph,
+        placeholder="証券コード 株数 平均取得単価 [取得日] [NISA/特定]\n例: 7832 100 3852 2026/05/19 NISA",
+        required=False,
+        max_length=2000,
+    )
+    nisa_used = discord.ui.TextInput(
+        label="今年すでに使った NISA 枠（万円・省略可）",
+        placeholder="省略すると、今年 NISA で買った保有の合計",
+        required=False,
+        max_length=10,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            cash = _man_yen(self.cash.value, "現金")
+            nisa = _man_yen(self.nisa_used.value, "今年使った NISA 枠") if self.nisa_used.value.strip() else None
+            plan = await battle.plan_start(
+                cash, self.holdings.value, nisa, lambda code: company_name(interaction.client, code), market.now_jst()
+            )
+        except battle.StartError as exc:
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+            return
+        except Exception as exc:  # 株価・銘柄名の取得の失敗など。「考え中」のまま止めない
+            await interaction.followup.send(f"⚠️ 初期条件の確認でエラーが発生しました: `{exc}`", ephemeral=True)
+            raise
+        await interaction.followup.send(
+            embed=reset_plan_embed(plan, market.now_jst()), view=ResetConfirmView(plan, interaction.user.id), ephemeral=True
+        )
+
+
+def _man_yen(text: str, label: str) -> float:
+    try:
+        value = float(text.replace(",", "").replace("万", "").replace("円", "").strip())
+    except ValueError:
+        raise battle.StartError(f"{label}は数字（万円）で書いてください。") from None
+    if value < 0:
+        raise battle.StartError(f"{label}は 0 以上にしてください。")
+    return round(value * 10_000)
+
+
+def reset_plan_embed(plan: battle.StartPlan, now: datetime, done: bool = False) -> discord.Embed:
+    title = "🔄 AI との勝負をやり直しました" if done else "🔄 この初期条件で、AI との勝負をやり直しますか？"
+    embed = discord.Embed(title=title, color=discord.Color.orange())
+    lines = [
+        "あなたと AI に同じ現金・保有を持たせて、ここから勝負します。",
+        f"開始時の総資産 **{_yen(plan.total)}**（現金 {_yen(plan.cash)} ＋ 保有の時価）",
+        f"今年使った NISA 枠 {_yen(plan.nisa_used)}（残り {_yen(portfolio.NISA_ANNUAL_LIMIT - plan.nisa_used)}）",
+    ]
+    if not done:
+        lines.append(
+            "\n⚠️ **あなたと AI の仮想口座・売買履歴・未約定の注文・勝負の記録（月ごとの勝敗）はすべて消えます。**"
+        )
+    embed.description = "\n".join(lines)
+    if plan.holdings:
+        rows = []
+        for h in plan.holdings:
+            gain = h.value - h.cost
+            rows.append(
+                f"{h.ticker} {h.company_name}（{portfolio.ACCOUNT_LABELS[h.account]}）{h.shares:,} 株 ・ "
+                f"取得 {h.opened_on:%Y/%m/%d} {_yen(h.cost)} → 時価 {_yen(h.value)}（{_yen(gain, sign=True)} / {gain / h.cost if h.cost else 0:+.1%}）"
+            )
+        # 登録する保有は確認のため全部見せる（1 欄 1024 文字に収まるよう、複数の欄に分ける）
+        chunks: list[list[str]] = [[]]
+        for row in rows:
+            if chunks[-1] and len("\n".join(chunks[-1] + [row])) > 1024:
+                chunks.append([])
+            chunks[-1].append(row[:1024])
+        for i, chunk in enumerate(chunks):
+            name = f"保有（両チーム共通・{len(rows)} 件）" if i == 0 else "保有（続き）"
+            embed.add_field(name=name, value="\n".join(chunk), inline=False)
+        if old := battle.long_held(plan, now.date()):
+            names = "、".join(h.company_name for h in old)
+            embed.add_field(
+                name="ℹ️ AI の売買ルール",
+                value=f"{names} は AI の最長保有（{ai_trader.MAX_HOLD_DAYS} 営業日）を過ぎているため、AI は次の判断で売ります。",
+                inline=False,
+            )
+    embed.set_footer(
+        text=f"時価は {plan.valued_on:%m/%d} の終値 ・ 成績（通算・月ごと）はこの総資産からの増減で測ります ・ 保有は翌取引日から AI の売買判断の対象になります"
+    )
+    return embed
+
+
+class ResetConfirmView(discord.ui.View):
+    def __init__(self, plan: battle.StartPlan, user_id: int) -> None:
+        super().__init__(timeout=600)
+        self.plan = plan
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.user_id
+
+    @discord.ui.button(label="やり直す", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="⏳ 口座を作り直しています…", embed=None, view=None)
+        now = market.now_jst()
+        try:
+            done = await interaction.client.run_reset(self.plan, now)
+        except Exception as exc:
+            self.stop()
+            await interaction.edit_original_response(content=f"⚠️ やり直しに失敗しました: `{exc}`")
+            raise
+        if not done:
+            # ボタンを戻して、処理が終わってから押し直せるようにする
+            await interaction.edit_original_response(
+                content="⏳ いま AI の判断か注文の約定の途中です。数分たってから、もう一度「やり直す」を押してください。",
+                embed=reset_plan_embed(self.plan, now),
+                view=self,
+            )
+            return
+        self.stop()
+        await interaction.edit_original_response(content="✅ やり直しました。", embed=None)
+        await interaction.followup.send(embed=reset_plan_embed(self.plan, now, done=True))
+        await db.log_notification("reset", detail=f"{self.plan.total:.0f}")
+
+    @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="やり直しをやめました。", embed=None, view=None)
+
+
 # ---------------------------------------------------------------- 便利コマンド（/chart /ranking /related）
 
 

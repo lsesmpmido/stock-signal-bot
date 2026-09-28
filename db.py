@@ -36,6 +36,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "vp_fee_rate": "0",  # 売買手数料（売買代金に対する割合。例: 0.0022 = 0.22%）
     "vp_default_amount": "200000",  # 金額を省略したときの購入額（円）
     "vp_next_deposit": "",  # 次回（1 月 1 日）の追加入金額（円）。空なら 240 万円
+    "vp_nisa_preset": "",  # 勝負を始める前に使った NISA 枠（"年:円"）。その年の NISA 枠の残りから差し引く
 }
 
 SCHEMA_SQL = """
@@ -652,6 +653,42 @@ async def vp_snapshots(owner: str) -> list[dict[str, Any]]:
         return await (
             await conn.execute("SELECT * FROM vp_snapshots WHERE owner = %s ORDER BY date", (owner,))
         ).fetchall()
+
+
+async def vp_reset(
+    cash: float,
+    deposits: float,
+    positions: list[dict[str, Any]],
+    started_at: datetime,
+    nisa_preset: str,
+) -> None:
+    """自分と AI の仮想口座を、同じ初期条件（現金・保有）で作り直す。売買履歴・注文・勝負の記録は消す。
+
+    positions: 両チームに持たせる保有（account, ticker, company_name, shares, cost, opened_at）。
+    """
+    async with _pool_or_raise().connection() as conn:
+        async with conn.transaction():
+            for table in ("vp_positions", "vp_trades", "vp_orders", "vp_snapshots"):
+                await conn.execute(f"DELETE FROM {table}")  # テーブル名は上の固定の一覧のものだけ
+            for owner in CASH_KEYS:
+                for p in positions:
+                    await conn.execute(
+                        "INSERT INTO vp_positions (owner, account, ticker, company_name, shares, cost, opened_at) "
+                        "VALUES (%(owner)s, %(account)s, %(ticker)s, %(company_name)s, %(shares)s, %(cost)s, %(opened_at)s)",
+                        {**p, "owner": owner},
+                    )
+            settings = {
+                **{key: str(cash) for key in CASH_KEYS.values()},
+                **{key: str(deposits) for key in DEPOSIT_KEYS.values()},
+                "vp_started_at": started_at.isoformat(),
+                "vp_nisa_preset": nisa_preset,
+            }
+            for key, value in settings.items():
+                await conn.execute(
+                    "INSERT INTO user_settings (key, value) VALUES (%s, %s) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    (key, value),
+                )
 
 
 # ---------------------------------------------------------------- notification_log

@@ -654,6 +654,41 @@ def related_embed(code: str, name: str, related: list, names: dict[str, str], wa
     return embed
 
 
+TREE_FIRST = 8  # 連想ツリーで、2 段階目をたどる 1 段階目の会社の数
+TREE_SECOND = 3  # 1 社から 2 段階目に出す会社の数
+
+
+def related_tree_embed(
+    code: str, name: str, first: list, second: dict[str, list], names: dict[str, str], watched: set, held: set
+) -> discord.Embed:
+    """関連企業と、その関連企業（2 段階）を、木の形で表示する。first・second は relations.Related のリスト。"""
+    embed = discord.Embed(title=f"🌳 {name} ({code}) の連想ツリー（2 段階）", color=discord.Color.teal())
+    if not first:
+        embed.description = "関係データに、この銘柄と上場企業との関係は見つかりませんでした。"
+        return embed
+
+    def mark(c: str) -> str:
+        return ("👀" if c in watched else "") + ("💰" if c in held else "")
+
+    for r in first[:TREE_FIRST]:
+        rows = [
+            f"└ {names[x.code]} ({x.code}){mark(x.code)}: {names[r.code]}の{x.label}" for x in second.get(r.code, [])
+        ]
+        embed.add_field(
+            name=f"{names[r.code]} ({r.code}){mark(r.code)}: {name}の{r.label}"[:256],
+            value="\n".join(rows)[:1024] or "（この先の関係は見つかりませんでした）",
+            inline=False,
+        )
+    rest = len(first) - TREE_FIRST
+    embed.description = (
+        f"1 段階目 {len(first)} 社のうち、業績への影響が大きい順に {min(len(first), TREE_FIRST)} 社をたどりました"
+        + (f"（ほか {rest} 社）" if rest > 0 else "")
+        + "\n👀 監視中　💰 仮想で保有中"
+    )
+    embed.set_footer(text="関係データ: JP Market Vis（EDINET 等から自動抽出。誤りを含む場合があります）")
+    return embed
+
+
 # ---------------------------------------------------------------- 追加入金・AI との勝負
 
 DEPOSIT_CHOICES = [(2_400_000, "240万円"), (1_200_000, "120万円"), (0, "入金しない")]

@@ -95,6 +95,10 @@ class RelationGraph:
                 best[other] = Related(other, rtype, priority, label)
         return sorted(best.values(), key=lambda r: (r.priority, r.code))
 
+    def pairs(self) -> list[tuple[str, str]]:
+        """関係のある企業の組（source, target）を、重複なく返す。"""
+        return sorted({(a, b) if a < b else (b, a) for a, others in self._edges.items() for b, _, _ in others})
+
     def _build(self, rows: list[dict]) -> None:
         edges: dict[str, list[tuple[str, str, bool]]] = {}
         for r in rows:

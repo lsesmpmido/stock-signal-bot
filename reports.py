@@ -330,5 +330,33 @@ async def weekly(now: datetime) -> discord.Embed:
     return embed
 
 
+async def surprising_link(master, relations, now: datetime) -> str | None:
+    """業種の違う会社同士のつながりを 1 つ選ぶ。監視銘柄・保有銘柄の関係を優先し、なければ全体から選ぶ（日替わり）。"""
+    def sector(code: str) -> str | None:
+        info = master.get(code)
+        return info.sector if info and info.sector and info.sector != "-" else None
+
+    watch, held, _ = await _targets()
+    mine = [
+        (c, r.code)
+        for c in dict.fromkeys([*watch, *held])
+        if (info := master.get(c))
+        for r in relations.neighbors(c, info.name)
+        if sector(c) and sector(r.code) and sector(c) != sector(r.code)
+    ]
+    pairs = mine or [(a, b) for a, b in relations.pairs() if sector(a) and sector(b) and sector(a) != sector(b)]
+    if not pairs:
+        return None
+    a, b = pairs[now.date().toordinal() % len(pairs)]
+    a_info, b_info = master.get(a), master.get(b)
+    link = next((r for r in relations.neighbors(a, a_info.name) if r.code == b), None)
+    if link is None:
+        return None
+    return (
+        f"{b_info.name} ({b})〔{b_info.sector}〕は、{a_info.name} ({a})〔{a_info.sector}〕の{link.label}"
+        + ("\n（あなたの監視・保有銘柄のつながりから）" if mine else "")
+    )
+
+
 BUILDERS = {"morning": morning, "close": close, "weekly": weekly}
 REPORT_LABELS = {"morning": "朝のブリーフィング", "close": "大引けレポート", "weekly": "週間レポート"}

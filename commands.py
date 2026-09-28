@@ -578,18 +578,43 @@ async def compare_command(
 
 
 @app_commands.command(name="related", description="関係データから、その銘柄の関連企業（取引先・親子会社・提携先など）を表示します")
-@app_commands.describe(code="証券コード（例: 7203）", private=PRIVATE_DESC)
+@app_commands.describe(
+    code="証券コード（例: 7203）", depth="たどる段階（既定: 1 段階）", private=PRIVATE_DESC
+)
+@app_commands.choices(
+    depth=[
+        app_commands.Choice(name="1 段階（関連企業）", value=1),
+        app_commands.Choice(name="2 段階（関連企業の関連企業まで）", value=2),
+    ]
+)
 @app_commands.default_permissions(manage_guild=True)
-async def related_command(interaction: discord.Interaction, code: str, private: bool = False) -> None:
+async def related_command(
+    interaction: discord.Interaction, code: str, depth: app_commands.Choice[int] | None = None, private: bool = False
+) -> None:
     async def body():
         c, name = await _resolve(interaction, code)
         client = interaction.client
-        # 上場銘柄一覧にない会社（上場廃止など）は、関連銘柄の提案と同じく表示しない
-        related = [r for r in client.relations.neighbors(c, name) if client.master.get(r.code)]
+
+        def listed(of: str, of_name: str) -> list:
+            # 上場銘柄一覧にない会社（上場廃止など）は、関連銘柄の提案と同じく表示しない
+            return [r for r in client.relations.neighbors(of, of_name) if client.master.get(r.code)]
+
+        related = listed(c, name)
         names = {r.code: client.master.get(r.code).name for r in related}
         watched = {s["ticker"] for s in await db.list_monitored()}
         held = {p["ticker"] for p in await db.vp_positions("you")}
-        embed = views.related_embed(c, name, related, names, watched, held)
+        if depth and depth.value == 2:
+            seen = {c, *names}
+            second = {}
+            for r in related[: views.TREE_FIRST]:
+                # 2 段階目は、元の銘柄と 1 段階目に出た会社を除き、業績への影響が大きい関係から数社
+                rows = [x for x in listed(r.code, names[r.code]) if x.code not in seen][: views.TREE_SECOND]
+                seen.update(x.code for x in rows)
+                second[r.code] = rows
+                names.update({x.code: client.master.get(x.code).name for x in rows})
+            embed = views.related_tree_embed(c, name, related, second, names, watched, held)
+        else:
+            embed = views.related_embed(c, name, related, names, watched, held)
         return {"embed": embed, "view": views.link_view(c)}
 
     await _run(interaction, private, body)

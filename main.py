@@ -307,7 +307,14 @@ class StockBot(ext_commands.Bot):
     # ------------------------------------------------------------ 定番レポート
 
     async def run_report(self, kind: str) -> None:
-        embed = await reports.BUILDERS[kind](market.now_jst())
+        now = market.now_jst()
+        embed = await reports.BUILDERS[kind](now)
+        if kind == "morning":
+            try:
+                if link := await reports.surprising_link(self.master, self.relations, now):
+                    embed.add_field(name="🧩 意外なつながり", value=link[:1024], inline=False)
+            except Exception:  # おまけの欄なので、失敗してもレポートは送る
+                log.exception("意外なつながりの作成に失敗しました")
         await (await self._report_channel()).send(embed=embed)
         await db.log_notification("report", detail=kind)
 

@@ -168,6 +168,18 @@ CREATE TABLE IF NOT EXISTS vp_snapshots (
     deposits    DOUBLE PRECISION NOT NULL,  -- その時点までの入金額の合計
     PRIMARY KEY (owner, date)
 );
+-- Jev のニュースの判定（提案しなかったものも含めてすべて）。銘柄ごとの感情スコアの推移に使う
+CREATE TABLE IF NOT EXISTS news_judgements (
+    ticker      TEXT NOT NULL,
+    news_url    TEXT NOT NULL,
+    news_title  TEXT NOT NULL,
+    kind        TEXT NOT NULL,  -- news（ニュースの当事者）/ related（関連銘柄）/ watch（監視銘柄のニュース）
+    is_positive DOUBLE PRECISION NOT NULL,
+    impact      DOUBLE PRECISION NOT NULL,
+    category    TEXT,
+    judged_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (ticker, news_url)
+);
 -- AI の大引け後の判断（銘柄ごとの売買・見送りと確信度）。翌取引日の朝にまとめて知らせる
 CREATE TABLE IF NOT EXISTS ai_decisions (
     decided_on  DATE PRIMARY KEY,
@@ -207,6 +219,7 @@ ALTER TABLE vp_snapshots     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE price_alerts     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notification_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ai_decisions     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE news_judgements  ENABLE ROW LEVEL SECURITY;
 """
 
 _pool: AsyncConnectionPool | None = None
@@ -703,6 +716,35 @@ async def vp_reset(
                     "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
                     (key, value),
                 )
+
+
+# ---------------------------------------------------------------- news_judgements
+
+
+async def save_judgement(
+    ticker: str, url: str, title: str, kind: str, is_positive: float, impact: float, category: str | None
+) -> None:
+    async with _pool_or_raise().connection() as conn:
+        await conn.execute(
+            "INSERT INTO news_judgements (ticker, news_url, news_title, kind, is_positive, impact, category) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (ticker, news_url) DO NOTHING",
+            (ticker, url, title, kind, is_positive, impact, category),
+        )
+
+
+async def judged_urls(ticker: str) -> set[str]:
+    async with _pool_or_raise().connection() as conn:
+        rows = await (await conn.execute("SELECT news_url FROM news_judgements WHERE ticker = %s", (ticker,))).fetchall()
+    return {r["news_url"] for r in rows}
+
+
+async def judgements(ticker: str, since: datetime) -> list[dict[str, Any]]:
+    async with _pool_or_raise().connection() as conn:
+        return await (
+            await conn.execute(
+                "SELECT * FROM news_judgements WHERE ticker = %s AND judged_at >= %s ORDER BY judged_at", (ticker, since)
+            )
+        ).fetchall()
 
 
 # ---------------------------------------------------------------- ai_decisions

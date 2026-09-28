@@ -45,6 +45,8 @@ MAX_RELATED_CANDIDATES = 30
 MAX_RELATED_PROPOSALS_PER_RUN = 5
 MAX_JEV_CANDIDATES = 150
 JEV_CONCURRENCY = 5
+WATCH_NEWS_PER_STOCK = 5  # 監視銘柄 1 社あたり、1 回に判定するニュースの数
+MAX_WATCH_NEWS = 40  # 監視銘柄のニュースを 1 回に判定する数の上限（Jev の呼び出しを抑える）
 PROPOSAL_DEDUP_DAYS = 3
 SLOT_GRACE = timedelta(minutes=10)
 
@@ -400,7 +402,13 @@ class StockBot(ext_commands.Bot):
         channel = await self._channel("DISCORD_CHANNEL_PROPOSAL")
         posted = await self._post_proposals(channel, passed)
         related_posted = await self._post_proposals(channel, related_passed[:MAX_RELATED_PROPOSALS_PER_RUN])
+        try:
+            watch_judged = await self.judge_watch_news()
+        except Exception:  # 感情スコアのための判定なので、失敗しても提案の結果は返す
+            log.exception("監視銘柄のニュースの判定に失敗しました")
+            watch_judged = 0
         return {
+            "watch_judged": watch_judged,
             "news": len(items),
             "candidates": len(candidates),
             "judged": len(results),
@@ -418,13 +426,37 @@ class StockBot(ext_commands.Bot):
         async def judge(item, info, ctx):
             async with semaphore:
                 try:
-                    relation = ctx[1] if ctx else None
-                    return item, info, ctx, await self.jev.judge(item.title, item.summary, info.name, relation)
+                    relation = None if ctx in (None, "watch") else ctx[1]
+                    j = await self.jev.judge(item.title, item.summary, info.name, relation)
                 except Exception:
                     log.warning("Jev 判定に失敗: %s / %s", info.name, item.title, exc_info=True)
                     return None
+            kind = "news" if ctx is None else "watch" if ctx == "watch" else "related"
+            try:  # 感情スコアの推移（/sentiment）のため、提案しなかった判定も残す
+                await db.save_judgement(info.code, item.url, item.title, kind, j.is_positive, j.impact, j.category)
+            except Exception:
+                log.warning("判定の保存に失敗: %s / %s", info.name, item.title, exc_info=True)
+            return item, info, ctx, j
 
         return [r for r in await asyncio.gather(*(judge(*t) for t in targets)) if r]
+
+    async def judge_watch_news(self) -> int:
+        """監視銘柄の直近のニュースを社名で検索し、まだ判定していない記事を Jev で判定して残す（提案はしない）。"""
+        targets = []
+        for s in await db.list_monitored():
+            info = self.master.get(s["ticker"])
+            if info is None:
+                continue
+            try:
+                items = await news.search_company(info.name, days=1, limit=WATCH_NEWS_PER_STOCK)
+            except Exception:
+                log.warning("監視銘柄のニュースを検索できませんでした: %s", info.name, exc_info=True)
+                continue
+            done = await db.judged_urls(info.code)
+            targets += [(item, info, "watch") for item in items if item.url not in done]
+        results = await self._judge_all(targets[:MAX_WATCH_NEWS])
+        log.info("監視銘柄のニュースを判定: %d 件", len(results))
+        return len(results)
 
     async def _post_proposals(self, channel, results: list[tuple]) -> int:
         posted = 0

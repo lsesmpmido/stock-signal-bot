@@ -1,8 +1,9 @@
-"""スラッシュコマンド: /settings, /watch add|remove|list|memo|star|tag, /alert add|list|remove, /buy, /sell, /portfolio, /orders, /battle, /deposit, /reset, /chart, /ranking, /compare, /related, /map, /review, /test proposal|signal|report"""
+"""スラッシュコマンド: /settings, /watch add|remove|list|memo|star|tag, /alert add|list|remove, /buy, /sell, /portfolio, /orders, /battle, /deposit, /reset, /chart, /ranking, /compare, /related, /map, /sentiment, /review, /test proposal|signal|report"""
 
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 
 import discord
 import pandas as pd
@@ -19,6 +20,7 @@ import signals
 import review
 import views
 import watchlist
+from jev_client import CATEGORIES
 from ticker_master import CODE_PATTERN, normalize_code
 
 TEST_SIGNAL_TIMEOUT = 300  # 秒
@@ -235,7 +237,8 @@ class TestGroup(
             f"ニュース {stats['news']} 件 → 銘柄が見つかった候補 {stats['candidates']} 件 → "
             f"Jev 判定 {stats['judged']} 件 → しきい値通過 {stats['passed']} 件 → 投稿 {stats['posted']} 件\n"
             f"関連銘柄: 候補 {stats['related_candidates']} 件 → しきい値通過 {stats['related_passed']} 件 → "
-            f"投稿 {stats['related_posted']} 件"
+            f"投稿 {stats['related_posted']} 件\n"
+            f"監視銘柄のニュース（感情スコア用）: Jev 判定 {stats['watch_judged']} 件"
         )
         if stats["posted"] + stats["related_posted"] == 0:
             text += "\n（直近 3 日以内に提案済み・監視中の銘柄は除外しています）"
@@ -620,6 +623,44 @@ async def related_command(
     await _run(interaction, private, body)
 
 
+SENTIMENT_DAYS = 90
+
+
+@app_commands.command(name="sentiment", description="その銘柄のニュースの感情スコア（Jev のプラス材料の確率）の推移を、株価と並べて表示します")
+@app_commands.describe(code="証券コード（例: 7203）", private=PRIVATE_DESC)
+@app_commands.default_permissions(manage_guild=True)
+async def sentiment_command(interaction: discord.Interaction, code: str, private: bool = False) -> None:
+    async def body():
+        c, name = await _resolve(interaction, code)
+        rows = await db.judgements(c, market.now_jst() - timedelta(days=SENTIMENT_DAYS))
+        if not rows:
+            raise CommandError(
+                f"{name} ({c}) のニュースの判定はまだありません。監視銘柄なら、提案ジョブ（8:30・16:00）のたびにニュースを判定して記録します。"
+            )
+        judged = pd.DataFrame(rows)
+        df = (await market.get_daily([c], refresh=False)).get(c)
+        png = await asyncio.to_thread(charts.sentiment_chart, c, name, judged, df)
+        recent = judged.tail(5).iloc[::-1]
+        embed = discord.Embed(
+            title=f"🌡️ {name} ({c}) ニュースの感情スコア（直近 {SENTIMENT_DAYS} 日）",
+            description=f"判定した記事 {len(judged)} 件 ・ 平均 {judged['is_positive'].mean():.0%}（50% より上ならプラス寄り）",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name="最近の記事",
+            value="\n".join(
+                f"・{r.is_positive:.0%} {CATEGORIES.get(r.category, CATEGORIES['other'])[0]} [{r.news_title[:60]}]({r.news_url})"
+                for r in recent.itertuples()
+            )[:1024],
+            inline=False,
+        )
+        embed.set_image(url="attachment://sentiment.png")
+        embed.set_footer(text="Jev の「この銘柄の株価にとってプラス材料か」の確率。提案しなかった記事も含む")
+        return {"embed": embed, "file": discord.File(png, filename="sentiment.png")}
+
+    await _run(interaction, private, body)
+
+
 MAP_NEIGHBORS = 4  # 関係図で、1 銘柄あたりに出す関連企業の数
 MAP_PRIMARY = 10  # 関係図に出す監視・保有銘柄の数
 
@@ -676,4 +717,5 @@ def setup(tree: app_commands.CommandTree) -> None:
     tree.add_command(compare_command)
     tree.add_command(related_command)
     tree.add_command(map_command)
+    tree.add_command(sentiment_command)
     tree.add_command(review_command)

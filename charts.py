@@ -278,3 +278,36 @@ def relation_map(primary: dict[str, str], others: dict[str, str], edges: list[tu
         ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.0), ncol=3, frameon=False, fontsize=9)
         ax.set_title("監視・保有銘柄と関連企業の関係図", fontsize=14, color=TEXT, loc="left")
     return _to_png(fig)
+
+
+def sentiment_chart(code: str, name: str, judged: pd.DataFrame, daily: pd.DataFrame | None) -> io.BytesIO:
+    """ニュースの感情スコア（Jev のプラス材料の確率）の推移と株価。judged は judged_at・is_positive の列を持つ。"""
+    judged = judged.copy()
+    judged["day"] = pd.to_datetime(judged["judged_at"]).dt.tz_convert(market.JST).dt.tz_localize(None).dt.normalize()
+    per_day = judged.groupby("day")["is_positive"].agg(["mean", "count"])
+
+    with plt.rc_context({"font.family": FONT_FAMILY}):
+        fig, ax = plt.subplots(figsize=(11, 5.5))
+        fig.patch.set_facecolor(SURFACE)
+        ax.set_facecolor(SURFACE)
+        ax.axhspan(0.5, 1.0, color=UP, alpha=0.05)
+        ax.axhspan(0.0, 0.5, color=DOWN, alpha=0.05)
+        ax.axhline(0.5, color=GRID, linewidth=1)
+        ax.scatter(judged["day"], judged["is_positive"], s=18, color=MUTED, alpha=0.35, label="記事ごと")
+        ax.plot(per_day.index, per_day["mean"], color=MA_COLORS["MA25"], linewidth=2, marker="o", markersize=4, label="日ごとの平均")
+        ax.set_ylim(0, 1)
+        ax.set_ylabel("プラス材料の確率（Jev）", color=TEXT)
+        ax.grid(color=GRID, linewidth=0.6, axis="x")
+        handles, labels = ax.get_legend_handles_labels()
+        if daily is not None and not daily.empty:
+            start = per_day.index.min() - pd.Timedelta(days=3)
+            price = daily[daily.index >= start]["Close"]
+            twin = ax.twinx()
+            twin.plot(price.index, price.values, color=MA_COLORS["MA75"], linewidth=1.4, alpha=0.9, label="株価（終値）")
+            twin.set_ylabel("株価（円）", color=TEXT)
+            h2, l2 = twin.get_legend_handles_labels()
+            handles, labels = handles + h2, labels + l2
+        ax.legend(handles, labels, loc="upper left", frameon=False, fontsize=9)
+        ax.set_title(f"{name} ({code}) ニュースの感情スコアの推移", fontsize=14, color=TEXT, loc="left")
+        fig.autofmt_xdate()
+    return _to_png(fig)

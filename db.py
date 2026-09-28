@@ -163,6 +163,13 @@ CREATE TABLE IF NOT EXISTS vp_snapshots (
     deposits    DOUBLE PRECISION NOT NULL,  -- その時点までの入金額の合計
     PRIMARY KEY (owner, date)
 );
+-- AI の大引け後の判断（銘柄ごとの売買・見送りと確信度）。翌取引日の朝にまとめて知らせる
+CREATE TABLE IF NOT EXISTS ai_decisions (
+    decided_on  DATE PRIMARY KEY,
+    data        JSONB NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reported_at TIMESTAMPTZ
+);
 CREATE TABLE IF NOT EXISTS notification_log (
     id      BIGSERIAL PRIMARY KEY,
     kind    TEXT NOT NULL,  -- proposal / signal / delist / report
@@ -194,6 +201,7 @@ ALTER TABLE vp_orders        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE vp_snapshots     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE price_alerts     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notification_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ai_decisions     ENABLE ROW LEVEL SECURITY;
 """
 
 _pool: AsyncConnectionPool | None = None
@@ -662,13 +670,13 @@ async def vp_reset(
     started_at: datetime,
     nisa_preset: str,
 ) -> None:
-    """自分と AI の仮想口座を、同じ初期条件（現金・保有）で作り直す。売買履歴・注文・勝負の記録は消す。
+    """自分と AI の仮想口座を、同じ初期条件（現金・保有）で作り直す。売買履歴・注文・勝負の記録・AI の判断は消す。
 
     positions: 両チームに持たせる保有（account, ticker, company_name, shares, cost, opened_at）。
     """
     async with _pool_or_raise().connection() as conn:
         async with conn.transaction():
-            for table in ("vp_positions", "vp_trades", "vp_orders", "vp_snapshots"):
+            for table in ("vp_positions", "vp_trades", "vp_orders", "vp_snapshots", "ai_decisions"):
                 await conn.execute(f"DELETE FROM {table}")  # テーブル名は上の固定の一覧のものだけ
             for owner in CASH_KEYS:
                 for p in positions:
@@ -689,6 +697,35 @@ async def vp_reset(
                     "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
                     (key, value),
                 )
+
+
+# ---------------------------------------------------------------- ai_decisions
+
+
+async def ai_save_decisions(day: date, data: dict[str, Any]) -> None:
+    """その日の AI の判断を保存する。同じ日に判断し直したら上書きし、まだ知らせていない扱いに戻す。"""
+    async with _pool_or_raise().connection() as conn:
+        await conn.execute(
+            "INSERT INTO ai_decisions (decided_on, data) VALUES (%s, %s) "
+            "ON CONFLICT (decided_on) DO UPDATE SET data = EXCLUDED.data, created_at = now(), reported_at = NULL",
+            (day, Jsonb(data)),
+        )
+
+
+async def ai_unreported_decisions(before: date) -> list[dict[str, Any]]:
+    """before より前の日の判断のうち、まだ知らせていないもの（古い順）。"""
+    async with _pool_or_raise().connection() as conn:
+        return await (
+            await conn.execute(
+                "SELECT * FROM ai_decisions WHERE decided_on < %s AND reported_at IS NULL ORDER BY decided_on",
+                (before,),
+            )
+        ).fetchall()
+
+
+async def ai_mark_reported(day: date) -> None:
+    async with _pool_or_raise().connection() as conn:
+        await conn.execute("UPDATE ai_decisions SET reported_at = now() WHERE decided_on = %s", (day,))
 
 
 # ---------------------------------------------------------------- notification_log

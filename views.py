@@ -378,6 +378,94 @@ def ai_fills_embed(executed: list[orders.Executed], mode: ai_trader.Mode, now) -
     return embed
 
 
+AI_LOG_LIMIT = 8  # 見送り・除外は、それぞれこの件数まで表示する
+
+
+def _pct(v: float | None) -> str:
+    return "—" if v is None else f"{v:.0%}"
+
+
+def _field_lines(lines: list[str], rest: int) -> str:
+    text = "\n".join(lines + ([f"ほか {rest} 件"] if rest > 0 else []))
+    return text if len(text) <= 1024 else text[:1020] + "…"
+
+
+def ai_decisions_embed(record: dict) -> discord.Embed:
+    """前の取引日の大引け後に AI が判断した内容（売買・持ち続け・見送りと、それぞれの確信度・理由）。"""
+    data, day = record["data"], record["decided_on"]
+    entries = data["entries"]
+    by_action: dict[str, list[dict]] = {}
+    for e in entries:
+        by_action.setdefault(e["action"], []).append(e)
+    sells, buys = by_action.get("sell", []), by_action.get("buy", [])
+    holds, passes = by_action.get("hold", []), by_action.get("pass", [])
+    blocked, skipped = by_action.get("blocked", []), by_action.get("skipped", [])
+
+    embed = discord.Embed(title=f"🧠 AIの判断（{day:%m/%d} 大引け後）{data['mode']}", color=discord.Color.dark_teal())
+    headline = (
+        f"売り {len(sells)} ・ 買い {len(buys)}" if sells or buys else "**売買はしませんでした**（すべて見送り・持ち続け）"
+    )
+    embed.description = (
+        f"{headline}\n"
+        f"持ち続け {len(holds)} ・ 見送り {len(passes)} ・ 安全ルールで除外 {len(blocked)} ・ Jev の判定 {data['judged']} 件\n"
+        f"基準: 買いの確信度 {data['buy_threshold']:.0%} 以上 ・ 売りの確信度 {data['sell_threshold']:.0%} 以上"
+    )
+    if not entries:
+        embed.description += "\n\n保有も候補もありませんでした（候補は提案銘柄・監視銘柄・あなたが買った銘柄）。"
+
+    def score(e: dict) -> str:
+        bonus = f"（弟子ボーナス +{e['bonus']:.0%} 込み）" if e.get("bonus") else ""
+        return f"{_pct(None if e['confidence'] is None else e['confidence'] + (e.get('bonus') or 0))}{bonus}"
+
+    if sells:
+        lines = [
+            f"**{e['name']}** ({e['ticker']}) — {e['note']}"
+            + (f" ・ 売りの確信度 {_pct(e['confidence'])}" if e["confidence"] is not None else "")
+            + f"\n　{e['facts']}"
+            for e in sells
+        ]
+        embed.add_field(name="🔴 売り", value=_field_lines(lines, 0), inline=False)
+    if buys:
+        lines = [
+            f"**{e['name']}** ({e['ticker']}) — 買いの確信度 {score(e)} ・ 候補: {'・'.join(e['sources'])}\n　{e['facts']}"
+            for e in buys
+        ]
+        embed.add_field(name="🟢 買い", value=_field_lines(lines, 0), inline=False)
+    if holds:
+        lines = [
+            f"{e['name']} ({e['ticker']}) — "
+            + (e["note"] if e["note"] else f"売りの確信度 {_pct(e['confidence'])}")
+            + f"\n　{e['facts']}"
+            for e in holds[:AI_LOG_LIMIT]
+        ]
+        embed.add_field(name="⏸️ 持ち続け", value=_field_lines(lines, len(holds) - AI_LOG_LIMIT), inline=False)
+    if passes:
+        passes = sorted(passes, key=lambda e: e["confidence"] + (e.get("bonus") or 0), reverse=True)
+        lines = [f"{e['name']} ({e['ticker']}) — 確信度 {score(e)} ・ {e['note']}" for e in passes[:AI_LOG_LIMIT]]
+        embed.add_field(name="👀 見送り（確信度の高い順）", value=_field_lines(lines, len(passes) - AI_LOG_LIMIT), inline=False)
+    if blocked:
+        lines = [f"{e['name']} ({e['ticker']}) — {e['note']}" for e in blocked[:AI_LOG_LIMIT]]
+        embed.add_field(
+            name="🛡️ 安全ルールで除外（Jev には聞かない）",
+            value=_field_lines(lines, len(blocked) - AI_LOG_LIMIT),
+            inline=False,
+        )
+    if skipped:
+        reasons: dict[str, int] = {}
+        for e in skipped:
+            reasons[e["note"] or "不明"] = reasons.get(e["note"] or "不明", 0) + 1
+        embed.add_field(
+            name="⚠️ 判定しなかった候補", value="、".join(f"{k} {v} 件" for k, v in reasons.items())[:1024], inline=False
+        )
+    embed.set_footer(
+        text="確信度は Jev の判定（0〜100%）。Jev は理由の文章を返さないため、判断に使った材料（RSI など）とルールを表示しています"
+    )
+    # 1 つの埋め込みも合計 6000 文字まで。超えたら重要度の低い欄（後ろ）から外す
+    while len(embed) > 6000 and embed.fields:
+        embed.remove_field(len(embed.fields) - 1)
+    return embed
+
+
 # ---------------------------------------------------------------- 初期条件の設定（/reset）
 
 

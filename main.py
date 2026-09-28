@@ -118,6 +118,24 @@ def report_slots(kind: str, day: datetime) -> list[datetime]:
     return [datetime.combine(d, REPORT_TIMES[kind], JST)] if ok else []
 
 
+MAX_EMBEDS_PER_MESSAGE = 10  # Discord の上限: 1 通に埋め込み 10 個まで、合計 6000 文字まで
+MAX_EMBED_CHARS_PER_MESSAGE = 6000
+
+
+def pack_embeds(items: list[tuple]) -> list[list[tuple]]:
+    """(埋め込み, 付随データ) の組を、Discord の 1 通の上限に収まるよう順番どおりに分ける。"""
+    batches: list[list[tuple]] = []
+    size = 0
+    for item in items:
+        n = len(item[0])
+        if not batches or len(batches[-1]) >= MAX_EMBEDS_PER_MESSAGE or size + n > MAX_EMBED_CHARS_PER_MESSAGE:
+            batches.append([])
+            size = 0
+        batches[-1].append(item)
+        size += n
+    return batches
+
+
 def due_slot(slots: list[datetime], now: datetime) -> str | None:
     """now の直前（猶予 10 分以内）に予定されていた実行時刻。tick が遅れても取りこぼさないようにする。"""
     due = [s for s in slots if s <= now < s + SLOT_GRACE]
@@ -466,7 +484,7 @@ class StockBot(ext_commands.Bot):
         return await battle.current_mode()
 
     async def run_ai_trader(self) -> ai_trader.Decisions:
-        """大引け後に AI が売買を判断し、翌取引日の始値で約定する注文を出す（注文の時点では知らせない）。"""
+        """大引け後に AI が売買を判断し、翌取引日の始値で約定する注文を出す（判断の内容は翌取引日の朝に知らせる）。"""
         return await ai_trader.decide(self.jev, await self.current_mode(), market.now_jst())
 
     async def save_snapshots(self) -> None:
@@ -541,19 +559,51 @@ class StockBot(ext_commands.Bot):
     # ------------------------------------------------------------ 注文の約定（取引時間外の注文を翌取引日の始値で）
 
     async def run_fill_job(self) -> None:
-        executed = await orders.fill_open_orders(market.now_jst())
+        """注文を約定させ、AI の前日の判断を知らせる。"""
+        now = market.now_jst()
+        executed = await orders.fill_open_orders(now)
         mine = [e for e in executed if e.order["owner"] == "you"]
         ai = [e for e in executed if e.order["owner"] == "ai"]
-        if not mine and not ai:
+        # 約定はもう済んでいるので、ここから先の失敗で約定の通知を落とさないよう、通知ごとに失敗を受け止める
+        # 前日の判断は、寄り付き（始値での約定）の後に知らせる。判断の直後に知らせると、AI の注文を見て同じ値段で買えてしまう
+        try:
+            decisions = await db.ai_unreported_decisions(now.date())
+        except Exception:
+            log.exception("AI の判断の読み込みに失敗しました")
+            decisions = []
+        if not (mine or ai or decisions):
             return
         channel = await self._report_channel()
-        if ai:
-            await channel.send(embed=views.ai_fills_embed(ai, await self.current_mode(), market.now_jst()))
-            for e in ai:
-                await db.log_notification("ai_trade", e.order["ticker"], e.order["side"])
         if mine:
             await channel.send(embed=views.fills_embed(mine, "you"))
             await db.log_notification("fill", detail=f"{len(mine)} 件")
+        try:
+            mode = await self.current_mode()
+        except Exception:  # 性格は見出しに出すだけなので、分からなければ通常として知らせる
+            log.exception("AI の性格の取得に失敗しました")
+            mode = ai_trader.MODES["normal"]
+        # (埋め込み, 送れたら通知済みにする判断) の組。約定した売買と判断は、Discord の上限に収まる範囲で 1 通にまとめる
+        items = [(views.ai_fills_embed(ai, mode, now), None)] if ai else []
+        for d in decisions:
+            try:
+                items.append((views.ai_decisions_embed(d), d))
+            except Exception:
+                # 表示できない記録で毎回失敗し続けないよう、通知済みにして飛ばす（記録は ai_decisions に残る）
+                log.exception("AI の判断（%s）を表示できませんでした", d["decided_on"])
+                await db.ai_mark_reported(d["decided_on"])
+        for batch in pack_embeds(items):
+            try:
+                await channel.send(embeds=[embed for embed, _ in batch])
+            except Exception:  # 送れなかった判断は通知済みにせず、次の約定処理で送り直す
+                log.exception("AI の売買・判断の通知に失敗しました")
+                continue
+            for embed, d in batch:
+                if d is None:
+                    for e in ai:
+                        await db.log_notification("ai_trade", e.order["ticker"], e.order["side"])
+                else:
+                    await db.ai_mark_reported(d["decided_on"])
+                    await db.log_notification("ai_decisions", detail=d["decided_on"].isoformat())
 
     # ------------------------------------------------------------ モジュール3: 売買シグナル
 

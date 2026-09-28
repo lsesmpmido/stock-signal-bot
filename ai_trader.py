@@ -6,6 +6,7 @@
 - 現金が足りなければ、保有で最も見劣りする銘柄より明らかに良い候補だけ入れ替える
 - 注文はすべて翌取引日の始値で約定する（orders.fill_open_orders）
 - 性格（モード）によって、1 回の金額・判断の基準・安全ルールの緩さが変わる
+- 銘柄ごとの判断（売買・見送りと確信度・理由）を DB に残し、翌取引日の朝にまとめて知らせる
 """
 
 from __future__ import annotations
@@ -66,12 +67,14 @@ class Candidate:
     sources: list[str]
     features: dict
     news: dict | None = None  # 提案銘柄なら、元のニュースと Jev の評価
-    confidence: float = 0.0
+    confidence: float | None = None  # Jev の「買う」の確信度（問い合わせていなければ None）
     bonus: float = 0.0  # 弟子モードの、自分の買い方との近さ
+    note: str | None = None  # 買わなかった理由（翌朝の「AI の判断」に出す）
+    blocked: list[str] = field(default_factory=list)  # 当たった安全ルール
 
     @property
     def score(self) -> float:
-        return self.confidence + self.bonus
+        return (self.confidence or 0.0) + self.bonus
 
 
 @dataclass
@@ -84,6 +87,8 @@ class HoldingView:
     held_days: int
     features: dict
     keep: float = 1.0  # 持ち続ける確信度（1 - 売る確信度）
+    sell_confidence: float | None = None  # Jev の「売る」の確信度（問い合わせていなければ None）
+    note: str | None = None  # 売らなかった理由の補足（Jev の判断に失敗したなど）
 
     @property
     def return_rate(self) -> float:
@@ -97,6 +102,7 @@ class Decisions:
     buys: list[Candidate] = field(default_factory=list)
     skipped_by_rules: int = 0
     judged: int = 0
+    log: list[dict] = field(default_factory=list)  # 銘柄ごとの判断（DB に保存して翌朝に知らせる）
 
 
 def _trading_days_since(start: datetime, today) -> int:
@@ -128,15 +134,34 @@ def features(df: pd.DataFrame) -> dict:
     }
 
 
-def _blocked(c: Candidate, mode: Mode) -> bool:
-    """高値づかみを防ぐ安全ルールに当たれば True。"""
+def _block_reasons(c: Candidate, mode: Mode) -> list[str]:
+    """高値づかみを防ぐ安全ルールのうち、当たったもの。空なら買ってよい。"""
     f = c.features
     rise = f.get("change_since_proposal")
-    return (
-        (rise is not None and rise >= mode.max_rise)
-        or (f["rsi"] is not None and f["rsi"] >= mode.max_rsi)
-        or (f["ma25_gap"] is not None and f["ma25_gap"] >= mode.max_ma_gap)
-    )
+    reasons = []
+    if rise is not None and rise >= mode.max_rise:
+        reasons.append(f"提案から {rise:+.1%}（{mode.max_rise:.0%} 以上）")
+    if f["rsi"] is not None and f["rsi"] >= mode.max_rsi:
+        reasons.append(f"RSI {f['rsi']:.0f}（{mode.max_rsi:.0f} 以上）")
+    if f["ma25_gap"] is not None and f["ma25_gap"] >= mode.max_ma_gap:
+        reasons.append(f"25 日線から {f['ma25_gap']:+.1%}（{mode.max_ma_gap:.0%} 以上）")
+    return reasons
+
+
+def _facts(f: dict) -> str:
+    """判断に使った値動きの状態を 1 行にまとめる（Jev は理由の文章を返さないので、材料を見せる）。"""
+    parts = []
+    if f.get("rsi") is not None:
+        parts.append(f"RSI {f['rsi']:.0f}")
+    if f.get("ma25_gap") is not None:
+        parts.append(f"25日線 {f['ma25_gap']:+.1%}")
+    if f.get("macd_above_signal") is not None:
+        parts.append("MACD↑" if f["macd_above_signal"] else "MACD↓")
+    if f.get("change_5d") is not None:
+        parts.append(f"5日 {f['change_5d']:+.1%}")
+    if f.get("change_since_proposal") is not None:
+        parts.append(f"提案から {f['change_since_proposal']:+.1%}")
+    return " ・ ".join(parts)
 
 
 async def _collect_candidates(now: datetime) -> dict[str, Candidate]:
@@ -249,8 +274,10 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
                 confidence = await jev.should_sell(state)
             except Exception:
                 log.warning("Jev の売り判断に失敗: %s", h.ticker, exc_info=True)
+                h.note = "Jev の判断に失敗したため持ち続ける"
                 continue
             decisions.judged += 1
+            h.sell_confidence = confidence
             h.keep = 1 - confidence
             if confidence >= mode.sell_threshold:
                 reason = "Jev の判断"
@@ -262,6 +289,7 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
     for c in candidates.values():
         df = daily.get(c.ticker)
         if df is None or len(df) < 80:
+            c.note = "株価データが足りない"
             continue
         c.features = features(df)
         if c.news:
@@ -271,9 +299,14 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
                 rise = df["Close"].iloc[-1] / before["Close"].iloc[-1] - 1
                 c.features["change_since_proposal"] = round(float(rise), 4)
     usable = [c for c in candidates.values() if c.features]
-    decisions.skipped_by_rules = sum(_blocked(c, mode) for c in usable)
+    for c in usable:
+        c.blocked = _block_reasons(c, mode)
+    decisions.skipped_by_rules = sum(bool(c.blocked) for c in usable)
     # 提案が新しいもの・自分が気にしているものを優先して、問い合わせる数を抑える
-    usable = [c for c in usable if not _blocked(c, mode)][:MAX_CANDIDATES]
+    usable = [c for c in usable if not c.blocked]
+    for c in usable[MAX_CANDIDATES:]:
+        c.note = f"問い合わせの上限（{MAX_CANDIDATES} 件）を超えた"
+    usable = usable[:MAX_CANDIDATES]
 
     style = await _your_style(daily) if mode.follow_you else None
     for c in usable:
@@ -287,10 +320,13 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
             c.confidence = await jev.should_buy(state)
         except Exception:
             log.warning("Jev の買い判断に失敗: %s", c.ticker, exc_info=True)
+            c.note = "Jev の判断に失敗した"
             continue
         decisions.judged += 1
         if style:
             c.bonus = round(0.1 * _similarity(c.features, style), 3)
+        if c.score < mode.buy_threshold:
+            c.note = f"買いの基準（{mode.buy_threshold:.0%}）に届かない"
 
     # ---- 注文（売り → 買い。現金が足りなければ入れ替え）
     cash = float((await db.get_all_settings())[db.CASH_KEYS[OWNER]])
@@ -299,16 +335,27 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
             await orders.place_sell(OWNER, h.ticker, None, p["account"], reason, confidence)
         cash += h.value
 
-    for c in sorted((c for c in usable if c.score >= mode.buy_threshold), key=lambda c: c.score, reverse=True):
+    eligible = sorted((c for c in usable if c.score >= mode.buy_threshold), key=lambda c: c.score, reverse=True)
+    for i, c in enumerate(eligible):
+        stop = None
         if len(decisions.buys) >= MAX_BUYS_PER_DAY:
-            break
-        if cash < mode.amount * 0.5:
+            stop = f"1 日に買う上限（{MAX_BUYS_PER_DAY} 件）に達した"
+        elif cash < mode.amount * 0.5:
             keepers = [h for h in holdings.values() if h.ticker not in selling]
             if not keepers:
-                break
-            weakest = min(keepers, key=lambda h: h.keep)
-            if c.score - weakest.keep < REPLACE_MARGIN:
-                break
+                stop = "現金が足りない"
+            else:
+                weakest = min(keepers, key=lambda h: h.keep)
+                if c.score - weakest.keep < REPLACE_MARGIN:
+                    stop = (
+                        f"現金が足りず、入れ替えの条件（{weakest.name} の持ち続ける確信度 {weakest.keep:.0%} を"
+                        f" {REPLACE_MARGIN * 100:.0f} ポイント以上上回る）に届かない"
+                    )
+        if stop:
+            for rest in eligible[i:]:
+                rest.note = stop
+            break
+        if cash < mode.amount * 0.5:
             reason = f"入れ替え（{c.name} を買うため）"
             for p in weakest.positions:
                 await orders.place_sell(OWNER, weakest.ticker, None, p["account"], reason, 1 - weakest.keep)
@@ -319,6 +366,18 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
         await orders.place_buy(OWNER, c.ticker, c.name, amount, f"Jev の判断（{mode.label}）", c.score, c.sources[0])
         decisions.buys.append(c)
         cash -= amount
+
+    decisions.log = _decision_log(decisions, holdings, candidates)
+    await db.ai_save_decisions(
+        today,
+        {
+            "mode": mode.label,
+            "buy_threshold": mode.buy_threshold,
+            "sell_threshold": mode.sell_threshold,
+            "judged": decisions.judged,
+            "entries": decisions.log,
+        },
+    )
     log.info(
         "AI の判断: %s、売り %d 件、買い %d 件（Jev 判定 %d 件、安全ルールで除外 %d 件）",
         mode.label,
@@ -328,3 +387,37 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
         decisions.skipped_by_rules,
     )
     return decisions
+
+
+def _decision_log(decisions: Decisions, holdings: dict[str, HoldingView], candidates: dict[str, Candidate]) -> list[dict]:
+    """銘柄ごとの判断。action は sell / hold / buy / pass（見送り）/ blocked（安全ルール）/ skipped（判定せず）。"""
+    entries = []
+    sold = {h.ticker: (reason, confidence) for h, reason, confidence in decisions.sells}
+    for h in holdings.values():
+        position = f"含み損益 {h.return_rate:+.1%} ・ 保有 {h.held_days} 営業日"
+        entry = {"ticker": h.ticker, "name": h.name, "facts": f"{position} ・ {_facts(h.features)}"}
+        if h.ticker in sold:
+            reason, confidence = sold[h.ticker]
+            entries.append({**entry, "action": "sell", "confidence": confidence, "note": reason})
+        else:
+            entries.append({**entry, "action": "hold", "confidence": h.sell_confidence, "note": h.note})
+    bought = {c.ticker for c in decisions.buys}
+    for c in candidates.values():
+        entry = {
+            "ticker": c.ticker,
+            "name": c.name,
+            "sources": [SOURCE_LABELS[s] for s in c.sources],
+            "confidence": c.confidence,
+            "bonus": c.bonus,
+            "facts": _facts(c.features),
+        }
+        if c.ticker in bought:
+            entries.append({**entry, "action": "buy", "note": None})
+        elif c.blocked:
+            entries.append({**entry, "action": "blocked", "note": "、".join(c.blocked)})
+        elif c.confidence is None:
+            entries.append({**entry, "action": "skipped", "note": c.note})
+        else:
+            entries.append({**entry, "action": "pass", "note": c.note})
+    return entries
+

@@ -558,7 +558,7 @@ def reset_plan_embed(plan: battle.StartPlan, now: datetime, done: bool = False) 
                 inline=False,
             )
     embed.set_footer(
-        text=f"時価は {plan.valued_on:%m/%d} の終値 ・ 成績（通算・月ごと）はこの総資産からの増減で測ります ・ 保有は翌取引日から AI の売買判断の対象になります"
+        text=f"時価は {plan.valued_on:%m/%d} の終値 ・ 成績（通算・月ごと）はこの総資産からの増減で測ります ・ 保有はすぐに AI の売買判断（取引時間中の損切り・今日の大引け後の判断）の対象になります"
     )
     return embed
 

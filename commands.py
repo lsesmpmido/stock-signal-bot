@@ -21,7 +21,7 @@ import review
 import views
 import watchlist
 from jev_client import CATEGORIES
-from ticker_master import CODE_PATTERN, normalize_code
+from ticker_master import CODE_PATTERN, normalize_code, sector_etf
 
 TEST_SIGNAL_TIMEOUT = 300  # 秒
 
@@ -542,21 +542,34 @@ async def ranking_command(
 COMPARE_PERIODS = {"3m": (63, "3か月"), "6m": (126, "6か月"), "1y": (245, "1年"), "2y": (490, "2年")}
 
 
-@app_commands.command(name="compare", description="2 銘柄の値動きを、期間の初日を 100 にそろえて比べます")
-@app_commands.describe(code1="証券コード 1", code2="証券コード 2", period="期間（既定: 6か月）", private=PRIVATE_DESC)
+@app_commands.command(name="compare", description="2 銘柄（または銘柄と、その業種の ETF）の値動きを、期間の初日を 100 にそろえて比べます")
+@app_commands.describe(
+    code1="証券コード 1",
+    code2="証券コード 2（省略すると、証券コード 1 の業種の ETF〔TOPIX-17 業種別〕と比べる）",
+    period="期間（既定: 6か月）",
+    private=PRIVATE_DESC,
+)
 @app_commands.choices(period=[app_commands.Choice(name=label, value=key) for key, (_, label) in COMPARE_PERIODS.items()])
 @app_commands.default_permissions(manage_guild=True)
 async def compare_command(
     interaction: discord.Interaction,
     code1: str,
-    code2: str,
+    code2: str | None = None,
     period: app_commands.Choice[str] | None = None,
     private: bool = False,
 ) -> None:
     bars, label = COMPARE_PERIODS[period.value if period else "6m"]
 
     async def body():
-        (c1, n1), (c2, n2) = await _resolve(interaction, code1), await _resolve(interaction, code2)
+        c1, n1 = await _resolve(interaction, code1)
+        if code2:
+            c2, n2 = await _resolve(interaction, code2)
+        else:
+            # 同業他社の代わりに、業種全体の値動き（業種別 ETF）と比べる
+            info = interaction.client.master.get(c1)
+            if not (info and (etf := sector_etf(info.sector))):
+                raise CommandError(f"{n1} ({c1}) の業種に対応する ETF が見つかりません。比べる銘柄を指定してください。")
+            c2, n2 = etf
         if c1 == c2:
             raise CommandError("違う銘柄を 2 つ指定してください。")
         d1, d2 = await _daily(c1, n1, min_bars=2), await _daily(c2, n2, min_bars=2)

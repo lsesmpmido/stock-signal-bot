@@ -317,8 +317,12 @@ async def buy_command(interaction: discord.Interaction, code: str, amount: float
     await interaction.followup.send(embed=views.placed_embed(placed, "buy", code, name))
 
 
-@app_commands.command(name="sell", description="仮想で売ります（株数を省略すると全部、口座を省略すると特定口座から）")
-@app_commands.describe(code="証券コード", shares="売る株数（省略すると全部）", account="売る口座（省略すると特定口座から先に売る）")
+@app_commands.command(name="sell", description="仮想で売ります（株数を省略すると全部。口座を省略すると特定口座から先に売る）")
+@app_commands.describe(
+    code="証券コード",
+    shares="売る株数（省略すると全部）",
+    account="売る口座（省略すると両方の口座から。特定口座から先に売り、足りない分を NISA から売る）",
+)
 @app_commands.choices(
     account=[app_commands.Choice(name=label, value=key) for key, label in portfolio.ACCOUNT_LABELS.items()]
 )
@@ -332,16 +336,36 @@ async def sell_command(
 ) -> None:
     await interaction.response.defer(thinking=True)
     code = normalize_code(code)
-    try:
-        placed = await orders.place_sell("you", code, shares, account.value if account else None)
-        name = await views.company_name(interaction.client, code)
-    except portfolio.TradeError as exc:
-        await interaction.followup.send(f"❌ {exc}")
+    positions = await db.vp_positions("you", code)
+    if account:
+        positions = [p for p in positions if p["account"] == account.value]
+    positions.sort(key=lambda p: p["account"] != "tokutei")  # NISA は長く持つ前提として、特定口座から先に売る
+    total = sum(p["shares"] for p in positions)
+    if not positions:
+        where = f"{account.name}で" if account else ""
+        await interaction.followup.send(f"❌ その銘柄を{where}保有していません。")
         return
-    except Exception as exc:
-        await interaction.followup.send(f"⚠️ 仮想売却でエラーが発生しました: `{exc}`")
-        raise
-    await interaction.followup.send(embed=views.placed_embed(placed, "sell", code, name))
+    if shares is not None and shares > total:
+        await interaction.followup.send(f"❌ 保有は {total:,} 株です（指定: {shares:,} 株）。")
+        return
+    name = positions[0]["company_name"]  # 売った後に銘柄名を調べに行かない（そこで失敗すると、売れたのにエラーに見える）
+    embeds, remaining = [], total if shares is None else shares
+    for p in positions:
+        if remaining <= 0:
+            break
+        n = min(remaining, p["shares"])
+        try:
+            placed = await orders.place_sell("you", code, n, p["account"])
+        except portfolio.TradeError as exc:
+            embeds.append(discord.Embed(description=f"❌ {portfolio.ACCOUNT_LABELS[p['account']]}: {exc}"))
+            break
+        except Exception as exc:
+            text = f"⚠️ {portfolio.ACCOUNT_LABELS[p['account']]}の仮想売却でエラーが発生しました: `{exc}`"
+            await interaction.followup.send(text, embeds=embeds)
+            raise
+        embeds.append(views.placed_embed(placed, "sell", code, name))
+        remaining -= n
+    await interaction.followup.send(embeds=embeds)
 
 
 @app_commands.command(name="portfolio", description="仮想ポートフォリオの保有・損益・NISA 枠の残りを表示します")

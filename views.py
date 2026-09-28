@@ -350,14 +350,19 @@ def fills_embed(executed: list[orders.Executed], owner: str) -> discord.Embed:
     return embed
 
 
-def ai_fills_embed(executed: list[orders.Executed], mode: ai_trader.Mode, now) -> discord.Embed:
-    """AI の今日の売買（寄り付きで約定したもの）をまとめる。"""
-    embed = discord.Embed(title=f"🤖 AIの売買（{now:%m/%d} 寄り付き）{mode.label}", color=discord.Color.dark_teal())
+def ai_fills_embed(
+    executed: list[orders.Executed], mode: ai_trader.Mode, now, title: str | None = None
+) -> discord.Embed:
+    """AI の今日の売買（寄り付きで約定したもの、または取引時間中の損切り）をまとめる。"""
+    title = title or f"🤖 AIの売買（{now:%m/%d} 寄り付き）{mode.label}"
+    embed = discord.Embed(title=title, color=discord.Color.dark_teal())
     lines = []
     for e in executed:
         o = e.order
         conf = f"確信度 {o['confidence']:.0%}" if o["confidence"] is not None else None
-        if e.result is None:
+        if e.result is None and o.get("intraday"):
+            lines.append(f"⚠️ {o['company_name']} ({o['ticker']}): {e.error}")
+        elif e.result is None:
             lines.append(f"⚠️ {o['company_name']} ({o['ticker']}) の注文は約定しませんでした（{e.error}）")
         elif isinstance(e.result, portfolio.BuyResult):
             r = e.result

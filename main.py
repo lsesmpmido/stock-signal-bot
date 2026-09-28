@@ -559,7 +559,7 @@ class StockBot(ext_commands.Bot):
     # ------------------------------------------------------------ 注文の約定（取引時間外の注文を翌取引日の始値で）
 
     async def run_fill_job(self) -> None:
-        """注文を約定させ、AI の前日の判断を知らせる。"""
+        """注文を約定させ、AI の前日の判断を知らせ、AI の取引時間中の損切りをする。"""
         now = market.now_jst()
         executed = await orders.fill_open_orders(now)
         mine = [e for e in executed if e.order["owner"] == "you"]
@@ -571,7 +571,12 @@ class StockBot(ext_commands.Bot):
         except Exception:
             log.exception("AI の判断の読み込みに失敗しました")
             decisions = []
-        if not (mine or ai or decisions):
+        try:
+            stops = await ai_trader.intraday_stop_loss(now)
+        except Exception:
+            log.exception("AI の取引時間中の損切りでエラーが発生しました")
+            stops = []
+        if not (mine or ai or decisions or stops):
             return
         channel = await self._report_channel()
         if mine:
@@ -604,6 +609,11 @@ class StockBot(ext_commands.Bot):
                 else:
                     await db.ai_mark_reported(d["decided_on"])
                     await db.log_notification("ai_decisions", detail=d["decided_on"].isoformat())
+        if stops:
+            title = f"🤖 AIが取引時間中に損切りしました（{now:%m/%d %H:%M}）"
+            await channel.send(embed=views.ai_fills_embed(stops, mode, now, title=title))
+            for e in stops:
+                await db.log_notification("ai_trade", e.order["ticker"], "stop_loss")
 
     # ------------------------------------------------------------ モジュール3: 売買シグナル
 

@@ -5,6 +5,7 @@
 - 保有銘柄は、安全ルール（損切り・最長保有）と Jev の「売るべきか」の判断で売る
 - 現金が足りなければ、保有で最も見劣りする銘柄より明らかに良い候補だけ入れ替える
 - 注文はすべて翌取引日の始値で約定する（orders.fill_open_orders）
+- 例外として、損切りだけは取引時間中にも調べ、含み損が基準に達したらその場の株価ですぐ売る（intraday_stop_loss）
 - 性格（モード）によって、1 回の金額・判断の基準・安全ルールの緩さが変わる
 - 銘柄ごとの判断（売買・見送りと確信度・理由）を DB に残し、翌取引日の朝にまとめて知らせる
 """
@@ -20,6 +21,7 @@ import pandas as pd
 import db
 import market
 import orders
+import portfolio
 import review
 import signals
 from jev_client import JevJudge
@@ -421,3 +423,55 @@ def _decision_log(decisions: Decisions, holdings: dict[str, HoldingView], candid
             entries.append({**entry, "action": "pass", "note": c.note})
     return entries
 
+
+async def intraday_stop_loss(now: datetime) -> list[orders.Executed]:
+    """取引時間中の損切り。含み損が STOP_LOSS に達した保有を、その場の株価（約 20 分遅れ）ですぐ売る。
+
+    自分の取引時間中の売買と同じ条件で約定させる。売った後に知らせるので、先回りされる心配はない。
+    """
+    if not market.is_trading_day(now.date()) or not (portfolio.MARKET_OPEN <= now.time() < portfolio.MARKET_CLOSE):
+        return []
+    # 前日の判断で出した売り注文がまだ約定していない銘柄は、その注文に任せる
+    pending_sells = {o["ticker"] for o in await db.vp_orders("open", OWNER) if o["side"] == "sell"}
+    by_ticker: dict[str, list[dict]] = {}
+    for p in await db.vp_positions(OWNER):
+        if p["ticker"] not in pending_sells:
+            by_ticker.setdefault(p["ticker"], []).append(p)
+    if not by_ticker:
+        return []
+    daily = await market.get_daily(sorted(by_ticker))
+    executed = []
+    for ticker, positions in by_ticker.items():
+        df = daily.get(ticker)
+        if df is None or df.empty or df.index[-1].date() != now.date():
+            continue  # 今日の株価がまだない
+        price = float(df["Close"].iloc[-1])
+        cost = sum(p["cost"] for p in positions)
+        rate = price * sum(p["shares"] for p in positions) / cost - 1 if cost else 0.0
+        if rate > STOP_LOSS:
+            continue
+        reason = f"損切り（取引時間中 {rate:+.1%}）"
+        for p in positions:
+            order = {
+                "ticker": ticker,
+                "company_name": p["company_name"],
+                "side": "sell",
+                "reason": reason,
+                "confidence": None,
+                "intraday": True,  # 注文を通さない売却（通知の文面を変える）
+            }
+            try:
+                result = await portfolio.sell(OWNER, ticker, price, None, p["account"], reason)
+            except portfolio.TradeError as exc:
+                executed.append(orders.Executed(order, None, f"売れませんでした（{exc}）"))
+                continue
+            except Exception:
+                # 1 件の失敗で、それまでに売れた分の通知まで止めない
+                log.exception("AI の取引時間中の損切りでエラー: %s（%s）", ticker, p["account"])
+                note = "エラーで、売れたかどうかを確かめられませんでした。`/portfolio` で AI の保有を確かめてください"
+                executed.append(orders.Executed(order, None, note))
+                continue
+            executed.append(orders.Executed(order, result))
+    if executed:
+        log.info("AI が取引時間中に損切り: %s", sorted({e.order["ticker"] for e in executed}))
+    return executed

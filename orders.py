@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import datetime
 
 import db
 import market
@@ -94,16 +94,6 @@ async def place_sell(
     return Placed(order_id=order_id)
 
 
-def _trading_days_between(start: date, end: date) -> int:
-    """start の翌日から end までの取引日の数。"""
-    days, d = 0, start
-    while d < end:
-        d += timedelta(days=1)
-        if market.is_trading_day(d):
-            days += 1
-    return days
-
-
 def queued_fill(now: datetime) -> tuple[str, str]:
     """今出した注文が、いつの株価で約定するか（いつ, なぜ）。注文を受け付けたときの表示に使う。"""
     t = now.time()
@@ -165,7 +155,7 @@ async def fill_open_orders(now: datetime) -> list[Executed]:
             on_today = bars is not None and not bars.empty and bars.index[-1].date() == today
             price, traded_at = (_afternoon_open(bars) if on_today else None), afternoon_at
         if price is None:
-            if _trading_days_between(order["created_at"].astimezone(JST).date(), today) >= EXPIRE_TRADING_DAYS:
+            if market.trading_days_between(order["created_at"].astimezone(JST).date(), today) >= EXPIRE_TRADING_DAYS:
                 await db.vp_update_order(order["id"], "expired", "株価を取得できないまま期限切れ")
                 executed.append(Executed(order, None, "株価を取得できないまま期限切れになりました"))
             continue

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime
 from typing import Awaitable, Callable
 
 import ai_trader
@@ -235,7 +235,7 @@ def long_held(plan: StartPlan, today: date) -> list[StartHolding]:
     return [
         h
         for h in plan.holdings
-        if ai_trader._trading_days_since(datetime.combine(h.opened_on, time(9), JST), today) >= ai_trader.MAX_HOLD_DAYS
+        if market.trading_days_between(h.opened_on, today) >= ai_trader.MAX_HOLD_DAYS
     ]
 
 

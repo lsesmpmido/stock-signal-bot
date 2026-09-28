@@ -107,15 +107,6 @@ class Decisions:
     log: list[dict] = field(default_factory=list)  # 銘柄ごとの判断（DB に保存して翌朝に知らせる）
 
 
-def _trading_days_since(start: datetime, today) -> int:
-    days, d = 0, start.astimezone(JST).date()
-    while d < today:
-        d += timedelta(days=1)
-        if market.is_trading_day(d):
-            days += 1
-    return days
-
-
 def features(df: pd.DataFrame) -> dict:
     """判断に使う値動きの状態。"""
     ind = signals.compute(df)
@@ -182,14 +173,14 @@ async def _collect_candidates(now: datetime) -> dict[str, Candidate]:
             c.news = news
 
     for p in reversed(await db.list_pending_since(now - timedelta(days=PROPOSAL_WINDOW * 2))):
-        if _trading_days_since(p["created_at"], today) <= PROPOSAL_WINDOW:
+        if market.trading_days_between(p["created_at"].astimezone(JST).date(), today) <= PROPOSAL_WINDOW:
             add(p["ticker"], p["company_name"], "proposal", p)
     for s in await db.list_monitored():
         add(s["ticker"], s["company_name"], "watch")
     for p in await db.vp_positions("you"):
         add(p["ticker"], p["company_name"], "your_holding")
     for t in await db.vp_trades("you", now - timedelta(days=YOUR_BUY_WINDOW * 2)):
-        if t["side"] == "buy" and _trading_days_since(t["traded_at"], today) <= YOUR_BUY_WINDOW:
+        if t["side"] == "buy" and market.trading_days_between(t["traded_at"].astimezone(JST).date(), today) <= YOUR_BUY_WINDOW:
             add(t["ticker"], t["company_name"], "your_holding")
     return found
 
@@ -254,12 +245,12 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
         h = holdings.get(p["ticker"])
         if h is None:
             h = holdings[p["ticker"]] = HoldingView(
-                p["ticker"], p["company_name"], [], 0.0, 0.0, _trading_days_since(p["opened_at"], today), features(df)
+                p["ticker"], p["company_name"], [], 0.0, 0.0, market.trading_days_between(p["opened_at"].astimezone(JST).date(), today), features(df)
             )
         h.positions.append(p)
         h.value += float(df["Close"].iloc[-1]) * p["shares"]
         h.cost += p["cost"]
-        h.held_days = max(h.held_days, _trading_days_since(p["opened_at"], today))
+        h.held_days = max(h.held_days, market.trading_days_between(p["opened_at"].astimezone(JST).date(), today))
 
     selling: set[str] = set()
     for h in holdings.values():

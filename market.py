@@ -48,6 +48,16 @@ def is_last_trading_day_of_week(d: date) -> bool:
     return not any(is_trading_day(d + timedelta(days=k)) for k in range(1, 5 - d.weekday()))
 
 
+def trading_days_between(start: date, end: date) -> int:
+    """start の翌日から end までの取引日の数（保有日数・注文の期限・候補の期間を数えるのに使う）。"""
+    days, d = 0, start
+    while d < end:
+        d += timedelta(days=1)
+        if is_trading_day(d):
+            days += 1
+    return days
+
+
 def now_jst() -> datetime:
     return datetime.now(JST)
 

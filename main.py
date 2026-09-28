@@ -583,8 +583,11 @@ class StockBot(ext_commands.Bot):
             return
         channel = await self._report_channel()
         if mine:
-            await channel.send(embed=views.fills_embed(mine, "you"))
-            await db.log_notification("fill", detail=f"{len(mine)} 件")
+            try:
+                await channel.send(embed=views.fills_embed(mine, "you"))
+                await db.log_notification("fill", detail=f"{len(mine)} 件")
+            except Exception:  # 自分の約定の通知に失敗しても、AI の売買・判断・損切りの通知は送る
+                log.exception("約定の通知に失敗しました")
         try:
             mode = await self.current_mode()
         except Exception:  # 性格は見出しに出すだけなので、分からなければ通常として知らせる

@@ -347,7 +347,7 @@ def fills_embed(executed: list[orders.Executed], owner: str) -> discord.Embed:
                 f"🔴 売り: {o['company_name']} ({o['ticker']}) {r.shares:,} 株 × {r.price:,.1f} 円"
                 f"（損益 {_yen(r.net, sign=True)} / {r.return_rate:+.1%}）"
             )
-    embed.description = "\n".join(lines)
+    embed.description = "\n".join(lines)[:4000]  # 埋め込みの説明は 4096 文字まで
     return embed
 
 

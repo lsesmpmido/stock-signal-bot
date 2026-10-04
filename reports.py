@@ -53,6 +53,13 @@ def _last_change(df: pd.DataFrame | None) -> float | None:
     return float(df["Close"].iloc[-1] / df["Close"].iloc[-2] - 1)
 
 
+def _today_change(df: pd.DataFrame | None) -> float | None:
+    """今日の足の騰落率。今日の足がまだ保存されていなければ None（前日の騰落を今日の値として見せないため）。"""
+    if df is None or df.empty or df.index[-1].date() != market.now_jst().date():
+        return None
+    return _last_change(df)
+
+
 def _change_since(df: pd.DataFrame | None, start: datetime) -> float | None:
     """start より前の最後の終値から、直近の終値までの騰落率（週間の騰落に使う）。"""
     if df is None or df.empty:
@@ -228,9 +235,9 @@ async def close(now: datetime) -> discord.Embed:
     tickers = list(dict.fromkeys([*watch, *held]))
     daily = await market.get_daily([*tickers, *market.INDEX_CODES], refresh=False)
     embed = discord.Embed(title=f"🔔 大引けレポート（{now:%m/%d}）", color=discord.Color.blue())
-    embed.add_field(name="今日の市場", value=_index_lines(daily, _last_change), inline=False)
+    embed.add_field(name="今日の市場", value=_index_lines(daily, _today_change), inline=False)
     embed.add_field(
-        name="監視・保有銘柄の騰落ランキング", value=_ranking(_moves(tickers, names, daily, _last_change)), inline=False
+        name="監視・保有銘柄の騰落ランキング", value=_ranking(_moves(tickers, names, daily, _today_change)), inline=False
     )
 
     signals_today = await db.notifications_since(_day_start(now), "signal")
@@ -240,7 +247,7 @@ async def close(now: datetime) -> discord.Embed:
     day_change = 0.0
     for h in s.holdings:
         df = daily.get(h.ticker)
-        if df is not None and len(df) >= 2:
+        if df is not None and len(df) >= 2 and _today_change(df) is not None:
             day_change += (df["Close"].iloc[-1] - df["Close"].iloc[-2]) * h.shares
     embed.add_field(
         name="仮想ポートフォリオ",
@@ -283,7 +290,7 @@ async def big_movers() -> list[tuple[str, str, float]]:
     watch, held, names = await _targets()
     tickers = list(dict.fromkeys([*watch, *held]))
     daily = await market.get_daily(tickers, refresh=False) if tickers else {}
-    moves = [m for m in _moves(tickers, names, daily, _last_change) if abs(m.change) >= BIG_MOVE]
+    moves = [m for m in _moves(tickers, names, daily, _today_change) if abs(m.change) >= BIG_MOVE]
     return [(m.ticker, m.name, m.change) for m in sorted(moves, key=lambda m: abs(m.change), reverse=True)]
 
 

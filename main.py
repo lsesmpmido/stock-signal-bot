@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 
 import discord
 from aiohttp import web
@@ -71,6 +71,7 @@ CLEANUP_TIME = time(10, 0)
 QUIZ_TIME = time(12, 0)  # 銘柄当てクイズ（取引日。前回の答えを発表してから出題する）
 THREAD_TIME = time(9, 0)  # 週末の振り返りスレッド（土曜）
 REPORT_TIMES = {"morning": time(8, 45), "close": time(16, 5), "weekly": time(16, 10)}
+PRICE_SYNC_WAIT = timedelta(minutes=30)  # 大引け後のレポートが、日足の保存の終わりを待つ最長の時間
 
 
 def proposal_slots(freq: str, day: datetime) -> list[datetime]:
@@ -181,6 +182,7 @@ class StockBot(ext_commands.Bot):
         self._relations_lock = asyncio.Lock()
         self._price_sync_lock = asyncio.Lock()
         self._report_lock = asyncio.Lock()
+        self._prices_synced_on: date | None = None  # その日の確定した日足を保存し終えた日
         self._fill_lock = asyncio.Lock()
         self._alert_lock = asyncio.Lock()
         self._hot_lock = asyncio.Lock()
@@ -347,7 +349,19 @@ class StockBot(ext_commands.Bot):
 
     # ------------------------------------------------------------ 定番レポート
 
+    async def _wait_for_price_sync(self) -> None:
+        """その日の日足の保存が動いていれば、終わるまで待つ（最長 PRICE_SYNC_WAIT）。"""
+        deadline = market.now_jst() + PRICE_SYNC_WAIT
+        while self._price_sync_lock.locked() and self._prices_synced_on != market.now_jst().date():
+            if market.now_jst() >= deadline:
+                log.warning("日足の保存が終わらないまま、レポートを送ります")
+                return
+            await asyncio.sleep(10)
+
     async def run_report(self, kind: str) -> None:
+        if kind in ("close", "weekly"):
+            # 大引け後のレポートは、16:00 の日足の保存が終わってから作る（前日の騰落を今日の値として載せないため）
+            await self._wait_for_price_sync()
         now = market.now_jst()
         embed = await reports.BUILDERS[kind](now)
         if kind == "morning":
@@ -600,6 +614,7 @@ class StockBot(ext_commands.Bot):
         codes += [t["ticker"] for t in await db.vp_trades("you", since) if t["side"] == "buy"]
         codes += list(market.INDEX_CODES)
         daily = await market.get_daily(codes)
+        self._prices_synced_on = market.now_jst().date()
         pruned = await market.prune_old_prices()
         log.info("日足を保存しました (%d / %d 銘柄、古い日足 %d 行を削除)", len(daily), len(set(codes)), pruned)
         try:

@@ -26,7 +26,7 @@ import portfolio
 import review
 import signals
 import watchlist
-from jev_client import CATEGORIES
+from jev_client import CATEGORIES, WAIT_HORIZONS
 from market import JST
 
 log = logging.getLogger(__name__)
@@ -852,6 +852,9 @@ def advice_embed(a: advisor.Advice) -> discord.Embed:
         f"{advisor.LOW:.0%} 以下で{'持ち続け' if a.question == 'sell' else '見送り'}）",
         color=a.color,
     )
+    if a.level == "mid":
+        wait = WAIT_HORIZONS[a.wait][0] if a.wait else "取得できませんでした"
+        embed.description += f"\n⏳ 判断し直すまでに待つ目安: **{wait}**（Jev の判定）"
     lines = []
     if f.get("rsi") is not None:
         lines.append(f"RSI(14): {f['rsi']:.0f}{_rsi_word(f['rsi'])}")

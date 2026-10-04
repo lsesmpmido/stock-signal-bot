@@ -35,6 +35,16 @@ CATEGORIES = {
 }
 
 
+# /ask で「様子見」のときの、待つ期間の目安。キー: (表示, Jev への説明)
+WAIT_HORIZONS = {
+    "week": ("1週間以内", "数日〜1週間のうちに、判断し直す材料や値動きの変化が出そう"),
+    "month": ("1週間〜1か月", "数週間のうちに、トレンドや指標の状態がはっきりしそう"),
+    "quarter": ("1か月〜3か月", "次の決算や材料の消化を待つなど、1〜3 か月ほど様子を見るべき"),
+    "half": ("3か月〜半年", "業績の変化やトレンドの転換を待つなど、数か月以上かかりそう"),
+    "unknown": ("不明", "材料や値動きからは、いつ判断し直すべきか見通せない"),
+}
+
+
 @dataclass(frozen=True)
 class Judgement:
     is_positive: float  # 0〜1（1 に近いほどプラス材料）
@@ -138,6 +148,25 @@ class JevJudge:
             },
         )
         return result.nouls["short"].noul, result.nouls["long"].noul
+
+    async def wait_horizon(self, state: dict, action: str) -> str:
+        """/ask 用: 今は様子見と判断した銘柄について、判断し直すまでに待つ期間の目安（WAIT_HORIZONS のキー）。"""
+        target = "買い時" if action == "buy" else "売り時"
+        result = await self._client.system_one(
+            state=state,
+            questions={
+                "wait": Choice(
+                    instructions=(
+                        f"この銘柄は、今はまだ{target}ではなく様子見と判断しました。"
+                        f"{target}が来るか、もう一度判断し直すまでに、どのくらい待つのがよいですか？"
+                        "材料の新しさ、トレンドの向きと強さ、RSI・MACD の状態から判断してください。"
+                    ),
+                    criteria={key: description for key, (_, description) in WAIT_HORIZONS.items()},
+                )
+            },
+        )
+        choice = result.choices["wait"].choice
+        return choice if choice in WAIT_HORIZONS else "unknown"
 
     async def should_sell(self, state: dict) -> float:
         """AI トレーダー用: 保有中のこの銘柄を翌取引日の寄り付きで売るべきかの確信度（0〜1）。"""

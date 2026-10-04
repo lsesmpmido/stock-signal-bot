@@ -415,7 +415,7 @@ def portfolio_embed(s: portfolio.Summary) -> discord.Embed:
     lines = [f"総資産 **{_yen(s.total_value)}**（入金額の合計 {_yen(s.deposits)} から {s.total_return:+.2%}）"]
     if s.topix_change is not None:
         diff = s.total_return - s.topix_change
-        lines.append(f"同じ期間の TOPIX {s.topix_change:+.2%} → 市場平均に {diff:+.2%} の{'勝ち' if diff >= 0 else '負け'}")
+        lines.append(f"同じ期間（軍資金で運用を始めた日から）の TOPIX {s.topix_change:+.2%} → 市場平均に {diff:+.2%} の{'勝ち' if diff >= 0 else '負け'}")
     lines.append(f"現金 {_yen(s.cash)} ・ 今年の NISA 枠の残り {_yen(s.nisa_left)}")
     embed.description = "\n".join(lines)
     for account, label in portfolio.ACCOUNT_LABELS.items():
@@ -432,6 +432,9 @@ def portfolio_embed(s: portfolio.Summary) -> discord.Embed:
         if len(rows) > 15:
             text.append(f"ほか {len(rows) - 15} 銘柄")
         embed.add_field(name=label, value="\n".join(text)[:1024], inline=False)
+    if s.outside:
+        rows = [f"{o['name']}（{portfolio.ACCOUNT_LABELS[o['account']]}）{_yen(o['cost'])}" for o in s.outside]
+        embed.add_field(name="ゲーム外の保有（取得額で固定）", value="\n".join(rows)[:1024], inline=False)
     if not s.holdings:
         empty = "まだ保有していません。" + ("`/buy` や「💰 仮想で買う」ボタンで買えます。" if s.owner == "you" else "")
         embed.add_field(name="保有", value=empty, inline=False)
@@ -610,9 +613,16 @@ class ResetModal(discord.ui.Modal, title="AI との勝負をやり直す"):
         required=False,
         max_length=2000,
     )
+    outside = discord.ui.TextInput(
+        label="ゲーム外の保有（米国株など・1 行に 1 件・省略可）",
+        style=discord.TextStyle.paragraph,
+        placeholder="名前 取得額(円) [取得日] [NISA/特定]\n例: SpaceX 64913 2026/06/12 NISA",
+        required=False,
+        max_length=1000,
+    )
     nisa_used = discord.ui.TextInput(
         label="今年すでに使った NISA 枠（万円・省略可）",
-        placeholder="省略すると、今年 NISA で買った保有の合計",
+        placeholder="省略すると、今年 NISA で買った保有（ゲーム外を含む）の合計",
         required=False,
         max_length=10,
     )
@@ -623,7 +633,12 @@ class ResetModal(discord.ui.Modal, title="AI との勝負をやり直す"):
             cash = _man_yen(self.cash.value, "現金")
             nisa = _man_yen(self.nisa_used.value, "今年使った NISA 枠") if self.nisa_used.value.strip() else None
             plan = await battle.plan_start(
-                cash, self.holdings.value, nisa, lambda code: company_name(interaction.client, code), market.now_jst()
+                cash,
+                self.holdings.value,
+                nisa,
+                lambda code: company_name(interaction.client, code),
+                market.now_jst(),
+                self.outside.value,
             )
         except battle.StartError as exc:
             await interaction.followup.send(f"❌ {exc}", ephemeral=True)
@@ -650,13 +665,14 @@ def reset_plan_embed(plan: battle.StartPlan, now: datetime, done: bool = False) 
     title = "🔄 AI との勝負をやり直しました" if done else "🔄 この初期条件で、AI との勝負をやり直しますか？"
     embed = discord.Embed(title=title, color=discord.Color.orange())
     lines = [
-        "あなたと AI に同じ現金・保有を持たせて、ここから勝負します。",
-        f"開始時の総資産 **{_yen(plan.total)}**（現金 {_yen(plan.cash)} ＋ 保有の時価）",
+        "3 チーム（あなた・慎重AI・大胆AI）に同じ現金・保有を持たせて、ここから勝負します。",
+        f"軍資金（入金額の合計）**{_yen(plan.base)}**（現金 {_yen(plan.cash)} ＋ 保有とゲーム外の保有の取得額）",
+        f"開始時の総資産 {_yen(plan.total)}（保有は時価） → 軍資金から {_yen(plan.total - plan.base, sign=True)}",
         f"今年使った NISA 枠 {_yen(plan.nisa_used)}（残り {_yen(portfolio.NISA_ANNUAL_LIMIT - plan.nisa_used)}）",
     ]
     if not done:
         lines.append(
-            "\n⚠️ **あなたと AI の仮想口座・売買履歴・未約定の注文・勝負の記録（月ごとの勝敗）はすべて消えます。**"
+            "\n⚠️ **3 チームの仮想口座・売買履歴・未約定の注文・勝負の記録（月ごとの勝敗）はすべて消えます。**"
         )
     embed.description = "\n".join(lines)
     if plan.holdings:
@@ -674,8 +690,14 @@ def reset_plan_embed(plan: battle.StartPlan, now: datetime, done: bool = False) 
                 chunks.append([])
             chunks[-1].append(row[:1024])
         for i, chunk in enumerate(chunks):
-            name = f"保有（両チーム共通・{len(rows)} 件）" if i == 0 else "保有（続き）"
+            name = f"保有（3 チーム共通・{len(rows)} 件）" if i == 0 else "保有（続き）"
             embed.add_field(name=name, value="\n".join(chunk), inline=False)
+    if plan.outside:
+        rows = [
+            f"{o.name}（{portfolio.ACCOUNT_LABELS[o.account]}）取得 {o.opened_on:%Y/%m/%d} {_yen(o.cost)}" for o in plan.outside
+        ]
+        embed.add_field(name="ゲーム外の保有（取得額のまま総資産に含める）", value="\n".join(rows)[:1024], inline=False)
+    if plan.holdings:
         if old := battle.long_held(plan, now.date()):
             names = "、".join(h.company_name for h in old)
             embed.add_field(
@@ -684,7 +706,7 @@ def reset_plan_embed(plan: battle.StartPlan, now: datetime, done: bool = False) 
                 inline=False,
             )
     embed.set_footer(
-        text=f"時価は {plan.valued_on:%m/%d} の終値 ・ 成績（通算・月ごと）はこの総資産からの増減で測ります ・ 保有はすぐに AI の売買判断（取引時間中の損切り・今日の大引け後の判断）の対象になります"
+        text=f"時価は {plan.valued_on:%m/%d} の終値 ・ 通算の成績は軍資金から、月ごとの勝敗は開始時の総資産から測ります ・ 保有はすぐに AI の売買判断（取引時間中の損切り・今日の大引け後の判断）の対象になります"
     )
     return embed
 

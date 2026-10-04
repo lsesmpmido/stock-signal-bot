@@ -871,6 +871,7 @@ async def vp_reset(
     positions: list[dict[str, Any]],
     started_at: datetime,
     nisa_preset: str,
+    extra_settings: dict[str, str] | None = None,
 ) -> None:
     """3 チーム（自分と 2 つの AI）の仮想口座を、同じ初期条件（現金・保有）で作り直す。売買履歴・注文・勝負の記録・AI の判断は消す。
 
@@ -892,6 +893,7 @@ async def vp_reset(
                 **{key: str(deposits) for key in DEPOSIT_KEYS.values()},
                 "vp_started_at": started_at.isoformat(),
                 "vp_nisa_preset": nisa_preset,
+                **(extra_settings or {}),
             }
             for key, value in settings.items():
                 await conn.execute(

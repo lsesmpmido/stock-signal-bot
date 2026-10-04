@@ -4,7 +4,9 @@
   1 回限りのログイン用リンク（5 分有効）を出す。リンクを開くとセッションの Cookie（30 日有効）を発行する。
   リンクのトークンとセッションは、DB にハッシュだけを保存する
 - 画面は見るだけ（売買などの操作はしない）。データは DB に保存済みの日足で計算する（ダウンロードし直さない）
-- 推移は、売買履歴と日足から日ごとの保有を計算し直す（今の保有から売買を逆にたどる）。新しく記録を始めなくても全期間を出せる
+- 推移は、売買履歴と日足から日ごとの保有を計算し直す（今の保有から売買を逆にたどる）。新しく記録を始めなくても全期間を出せる。
+  勝負を始める前も、開始時点の保有（vp_start_holdings）を取得日から持っていたとして、最も古い取得日から描く
+  （その間の現金は、開始時点の現金に、まだ買っていない保有の取得額を足したもの）
 """
 
 from __future__ import annotations
@@ -111,9 +113,29 @@ async def summary_data(team: str) -> dict[str, Any]:
         )
     rows.sort(key=lambda r: r["value"], reverse=True)
     stock = sum(r["value"] for r in rows)
+    # ゲーム外の保有（米国株など）は、取得額のまま一覧の最後に出す（国内株式の合計額には含めない）
+    for o in s.outside:
+        rows.append(
+            {
+                "ticker": "",
+                "name": f"{o['name']}（ゲーム外）",
+                "account": o["account"],
+                "outside": True,
+                "shares": None,
+                "cost": o["cost"],
+                "price": None,
+                "value": o["cost"],
+                "unrealized": None,
+                "unrealized_rate": None,
+                "day_change": None,
+                "day_rate": None,
+                "month_change": None,
+                "month_rate": None,
+            }
+        )
 
     def total(key: str) -> float | None:
-        values = [r[key] for r in rows if r[key] is not None]
+        values = [r[key] for r in rows if r[key] is not None and not r.get("outside")]
         return sum(values) if values else None
 
     day, month, unrealized = total("day_change"), total("month_change"), total("unrealized")
@@ -152,12 +174,19 @@ def _split_factor(splits: list[dict], ticker: str, traded_on: date) -> float:
 async def history_data(team: str) -> dict[str, Any]:
     """日ごとの保有（銘柄ごと・口座ごとの時価）と現金・入金額の合計。今の保有と現金から、売買と入金を逆にたどって求める。"""
     settings = await db.get_all_settings()
-    start = datetime.fromisoformat(settings["vp_started_at"]).astimezone(JST).date()
+    started_on = datetime.fromisoformat(settings["vp_started_at"]).astimezone(JST).date()
+    start_holdings = portfolio.start_holdings(settings)
+    outside = portfolio.outside_holdings(settings, market.now_jst().date())
+    start = portfolio.invested_since(settings)
     positions = await db.vp_positions(team)
     trades = await db.vp_trades(team)
     snapshots = await db.vp_snapshots(team)
     splits = await db.all_splits()
-    names = {t["ticker"]: t["company_name"] for t in trades} | {p["ticker"]: p["company_name"] for p in positions}
+    names = (
+        {h["ticker"]: h["name"] for h in start_holdings}
+        | {t["ticker"]: t["company_name"] for t in trades}
+        | {p["ticker"]: p["company_name"] for p in positions}
+    )
     daily = await market.get_daily(sorted(set(names) | {"1306"}), years=6, refresh=False)
     calendar = sorted({d for df in daily.values() for d in df.index.date if d >= start})
     if not calendar:
@@ -186,7 +215,18 @@ async def history_data(team: str) -> dict[str, Any]:
                 shares[key] = shares.get(key, 0.0) + n
                 cash -= t["amount"] - t["fee"] - t["tax"]
             i += 1
-        states.append((d, dict(shares), cash))
+        if d < started_on:
+            # 勝負を始める前: 開始時点の保有のうち、その日までに買ったものだけを持ち、まだ買っていない分は現金にある
+            held = {(h["ticker"], h["account"]): 0.0 for h in start_holdings}
+            cash_then = cash
+            for h in start_holdings:
+                if h["opened_on"] <= d:
+                    held[(h["ticker"], h["account"])] += h["shares"] * _split_factor(splits, h["ticker"], started_on)
+                else:
+                    cash_then += h["cost"]
+            states.append((d, held, cash_then))
+        else:
+            states.append((d, dict(shares), cash))
     states.reverse()
 
     closes = {code: df["Close"] for code, df in daily.items() if not df.empty}
@@ -200,6 +240,12 @@ async def history_data(team: str) -> dict[str, Any]:
         cash_on_day = cash_then - (deposits_now - deposits)
         values = {"nisa": 0.0, "tokutei": 0.0}
         day_by_ticker: dict[str, float] = {}
+        for o in outside:  # ゲーム外の保有は、取得日から取得額のまま持つ。それまでは現金にある
+            if o["opened_on"] <= d:
+                values[o["account"]] += o["cost"]
+                day_by_ticker[f"outside:{o['name']}"] = day_by_ticker.get(f"outside:{o['name']}", 0.0) + o["cost"]
+            else:
+                cash_on_day += o["cost"]
         for (ticker, account), count in held.items():
             if count <= 0 or ticker not in closes:
                 continue
@@ -217,6 +263,8 @@ async def history_data(team: str) -> dict[str, Any]:
         cash_series.append(cash_on_day)
         total_series.append(cash_on_day + values["nisa"] + values["tokutei"])
 
+    for o in outside:
+        names[f"outside:{o['name']}"] = f"{o['name']}（ゲーム外）"
     ranked = sorted(by_ticker, key=lambda t: max(by_ticker[t]), reverse=True)
     tickers = [{"ticker": t, "name": names.get(t, t), "values": by_ticker[t]} for t in ranked[:MAX_TICKERS]]
     if len(ranked) > MAX_TICKERS:

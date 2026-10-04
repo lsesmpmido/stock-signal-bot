@@ -9,8 +9,9 @@
 
 from __future__ import annotations
 
+import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Awaitable, Callable
 
@@ -83,8 +84,12 @@ class Standing:
         return results.count("you"), results.count(ai), results.count("draw")
 
 
-def _monthly_returns(snapshots: list[dict]) -> dict[str, float]:
-    """月ごとの増減率。前月末の総資産（最初の月は入金額）を基準に、その月の入金分を除いて計算する。"""
+def _monthly_returns(snapshots: list[dict], start_value: float | None = None) -> dict[str, float]:
+    """月ごとの増減率。前月末の総資産を基準に、その月の入金分を除いて計算する。
+
+    最初の月の基準は、勝負を始めた時点の総資産（時価。start_value）。記録がなければ入金額の合計。
+    軍資金（入金額の合計）は取得額で数えるので、始める前の含み益を最初の月の成績に入れないため。
+    """
     by_month: dict[str, list[dict]] = {}
     for s in snapshots:
         by_month.setdefault(s["date"].strftime("%Y-%m"), []).append(s)
@@ -92,7 +97,8 @@ def _monthly_returns(snapshots: list[dict]) -> dict[str, float]:
     for month in sorted(by_month):
         end = by_month[month][-1]
         if prev is None:
-            start_value, deposited = by_month[month][0]["deposits"], end["deposits"] - by_month[month][0]["deposits"]
+            first = by_month[month][0]["deposits"]
+            start_value, deposited = (start_value if start_value is not None else first), end["deposits"] - first
         else:
             start_value, deposited = prev["total_value"], end["deposits"] - prev["deposits"]
         base = start_value + deposited
@@ -119,7 +125,9 @@ def _mode(finished: list[MonthResult]) -> ai_trader.Mode:
 
 
 async def standing() -> Standing:
-    returns = {team: _monthly_returns(await db.vp_snapshots(team)) for team in TEAMS}
+    settings = await db.get_all_settings()
+    start_value = float(settings["vp_start_value"]) if settings.get("vp_start_value") else None
+    returns = {team: _monthly_returns(await db.vp_snapshots(team), start_value) for team in TEAMS}
     this_month = market.now_jst().strftime("%Y-%m")
     months = [
         MonthResult(m, {team: r[m] for team, r in returns.items() if m in r}, m < this_month)
@@ -155,17 +163,75 @@ class StartHolding:
 
 
 @dataclass(frozen=True)
+class OutsideHolding:
+    """このアプリで扱えない保有（米国株など）。値動きは追わず、取得額のまま総資産に含める。"""
+
+    name: str
+    account: str
+    cost: float
+    opened_on: date
+
+
+@dataclass(frozen=True)
 class StartPlan:
     cash: float
     holdings: list[StartHolding]
     nisa_used: float  # 今年すでに使った NISA 枠
     year: int
     valued_on: date  # 保有の評価に使った終値の日付（最も新しいもの）
+    outside: list[OutsideHolding] = field(default_factory=list)
+
+    @property
+    def base(self) -> float:
+        """軍資金（現金＋保有の取得額＋ゲーム外の保有の取得額）。入金額の合計とし、通算の成績はここからの増減で測る。"""
+        return self.cash + sum(h.cost for h in self.holdings) + sum(o.cost for o in self.outside)
 
     @property
     def total(self) -> float:
-        """開始時点の総資産。入金額の合計とし、勝負の成績はここからの増減で測る。"""
-        return self.cash + sum(h.value for h in self.holdings)
+        """開始時点の総資産（保有は時価、ゲーム外の保有は取得額）。月ごとの勝敗は、最初の月はここから測る。"""
+        return self.cash + sum(h.value for h in self.holdings) + sum(o.cost for o in self.outside)
+
+
+OUTSIDE_WORD = "ゲーム外"
+
+
+def _date_and_account(tokens: list[str], where: str, today: date) -> tuple[date, str]:
+    """[取得日] [NISA/特定] を読む。取得日の既定は今日、口座の既定は特定口座。"""
+    opened_on, account = today, "tokutei"
+    for token in tokens:
+        if m := DATE_PATTERN.fullmatch(token):
+            try:
+                opened_on = date(int(m[1]), int(m[2]), int(m[3]))
+            except ValueError:
+                raise StartError(f"{where}: `{token}` は存在しない日付です。") from None
+        elif token.lower() in ACCOUNT_WORDS:
+            account = ACCOUNT_WORDS[token.lower()]
+        else:
+            raise StartError(f"{where}: `{token}` が読み取れません（取得日は 2026/05/19、口座は NISA か 特定）。")
+    if opened_on > today:
+        raise StartError(f"{where}: 取得日が未来の日付です。")
+    return opened_on, account
+
+
+def parse_outside(text: str, today: date) -> list[OutsideHolding]:
+    """1 行に 1 件「名前 取得額(円) [取得日] [NISA/特定]」を読む（米国株など、このアプリで扱えない保有）。"""
+    rows = []
+    for no, line in enumerate(text.splitlines(), start=1):
+        tokens = [t for t in re.split(r"[\s,、]+", line.strip()) if t]
+        if not tokens:
+            continue
+        where = f"ゲーム外の保有の {no} 行目「{line.strip()}」"
+        if len(tokens) < 2:
+            raise StartError(f"{where}: 名前と取得額（円）の 2 つが必要です。")
+        try:
+            cost = float(tokens[1].replace("円", ""))
+        except ValueError:
+            raise StartError(f"{where}: 取得額は数字（円）で書いてください。") from None
+        if cost <= 0:
+            raise StartError(f"{where}: 取得額は 0 より大きくしてください。")
+        opened_on, account = _date_and_account(tokens[2:], where, today)
+        rows.append(OutsideHolding(tokens[0][:40], account, cost, opened_on))
+    return rows
 
 
 def parse_holdings(text: str, today: date) -> list[tuple[str, int, float, date, str]]:
@@ -188,19 +254,7 @@ def parse_holdings(text: str, today: date) -> list[tuple[str, int, float, date, 
             raise StartError(f"{where}: 株数と平均取得単価は数字で書いてください。") from None
         if shares <= 0 or price <= 0:
             raise StartError(f"{where}: 株数と平均取得単価は 0 より大きくしてください。")
-        opened_on, account = today, "tokutei"
-        for token in tokens[3:]:
-            if m := DATE_PATTERN.fullmatch(token):
-                try:
-                    opened_on = date(int(m[1]), int(m[2]), int(m[3]))
-                except ValueError:
-                    raise StartError(f"{where}: `{token}` は存在しない日付です。") from None
-            elif token.lower() in ACCOUNT_WORDS:
-                account = ACCOUNT_WORDS[token.lower()]
-            else:
-                raise StartError(f"{where}: `{token}` が読み取れません（取得日は 2026/05/19、口座は NISA か 特定）。")
-        if opened_on > today:
-            raise StartError(f"{where}: 取得日が未来の日付です。")
+        opened_on, account = _date_and_account(tokens[3:], where, today)
         rows.append((code, shares, price, opened_on, account))
     return rows
 
@@ -211,17 +265,19 @@ async def plan_start(
     nisa_used: float | None,
     name_of: Callable[[str], Awaitable[str]],
     now: datetime,
+    outside_text: str = "",
 ) -> StartPlan:
     """入力を確かめて、初期条件を組み立てる（まだ DB は変えない）。"""
     if cash < 0:
         raise StartError("現金は 0 以上にしてください。")
     rows = parse_holdings(holdings_text, now.date())
+    outside = parse_outside(outside_text, now.date())
     # 今年 NISA で買った額は、行をまとめる前に行ごとに数える（まとめると取得日が最も古い日になるため）
     bought_this_year = sum(
         round(price * shares)
         for _, shares, price, opened_on, account in rows
         if account == "nisa" and opened_on.year == now.year
-    )
+    ) + sum(o.cost for o in outside if o.account == "nisa" and o.opened_on.year == now.year)
     merged: dict[tuple[str, str], list] = {}  # 同じ銘柄・同じ口座の行は 1 つの保有にまとめる
     for code, shares, price, opened_on, account in rows:
         m = merged.setdefault((code, account), [0, 0.0, opened_on])
@@ -253,7 +309,7 @@ async def plan_start(
         raise StartError(
             f"今年使った NISA 枠は、今年 NISA で買った保有の合計（{bought_this_year:,.0f} 円）以上、240 万円以下にしてください。"
         )
-    return StartPlan(cash, holdings, nisa_used, now.year, max(valued, default=cutoff))
+    return StartPlan(cash, holdings, nisa_used, now.year, max(valued, default=cutoff), outside)
 
 
 def long_held(plan: StartPlan, today: date) -> list[StartHolding]:
@@ -279,5 +335,16 @@ async def apply_start(plan: StartPlan, now: datetime) -> None:
         for h in plan.holdings
     ]
     preset = f"{plan.year}:{plan.nisa_used:.0f}" if plan.nisa_used else ""
+    # 開始時点の保有とゲーム外の保有は、推移のグラフを始める前の期間から描くのに使う
+    start_holdings = [
+        {"ticker": h.ticker, "name": h.company_name, "account": h.account, "shares": h.shares, "cost": h.cost, "opened_on": h.opened_on.isoformat()}
+        for h in plan.holdings
+    ]
+    outside = [{"name": o.name, "account": o.account, "cost": o.cost, "opened_on": o.opened_on.isoformat()} for o in plan.outside]
+    extra = {
+        "vp_start_value": f"{plan.total:.0f}",
+        "vp_start_holdings": json.dumps(start_holdings, ensure_ascii=False),
+        "vp_outside_holdings": json.dumps(outside, ensure_ascii=False),
+    }
     async with portfolio.trade_lock():
-        await db.vp_reset(plan.cash, plan.total, positions, now, preset)
+        await db.vp_reset(plan.cash, plan.base, positions, now, preset, extra)

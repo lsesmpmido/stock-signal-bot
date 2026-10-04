@@ -81,7 +81,7 @@
 
   <section id="tab-portfolio" class="hidden">
     <div class="card">
-      <div class="label">総資産（現金＋株式の時価）</div>
+      <div class="label">総資産（現金＋株式の時価＋ゲーム外の保有の取得額）</div>
       <div class="big" id="total"></div>
       <div class="row"><span class="label">入金額の合計</span><span id="deposits"></span></div>
       <div class="row"><span class="label">入金額からの損益（率）</span><span id="total-return"></span></div>
@@ -89,7 +89,7 @@
     </div>
 
     <div class="card">
-      <div class="label">国内株式の合計額</div>
+      <div class="label">国内株式の合計額（ゲーム外の保有を除く）</div>
       <div class="big" id="stock"></div>
       <div class="row"><span class="label">評価損益（率）</span><span id="unrealized"></span></div>
       <div class="row"><span class="label">前日比（率）</span><span id="day"></span></div>
@@ -135,7 +135,7 @@
         <button data-stack="account">NISA／特定口座</button>
       </div>
       <div class="chart-box tall"><canvas id="history"></canvas></div>
-      <div class="note">積み上げ棒は各日の大引け時点の時価（現金を含む）。線は入金額の合計。全期間は週ごとに間引いて表示します。</div>
+      <div class="note">積み上げ棒は各日の大引け時点の時価（現金を含む。ゲーム外の保有は取得額）。線は入金額の合計（軍資金）。勝負を始める前は、開始時点の保有を取得日から持っていたとして描きます（3 チーム共通）。全期間は週ごとに間引いて表示します。</div>
     </div>
   </section>
 </main>
@@ -146,6 +146,21 @@
 const LABELS = { you: "あなた", ai: "慎重AI", ai_bold: "大胆AI" };
 const ACCOUNT_LABELS = { nisa: "NISA", tokutei: "特定口座" };
 const PALETTE = ["#e8505b", "#f5a623", "#4caf50", "#3b82f6", "#9b59b6", "#14b8a6", "#f06292", "#8d6e63", "#78909c"];
+
+// 銘柄ごとの色。円グラフと推移のグラフで同じ銘柄が同じ色になるよう、初めて出てきた順に割り当てて覚えておく
+const colorOf = (() => {
+  let map = {};
+  try { map = JSON.parse(localStorage.getItem("colors") || "{}"); } catch (e) { map = {}; }
+  return (key) => {
+    if (!(key in map)) {
+      const used = new Set(Object.values(map));
+      const free = PALETTE.findIndex((_, i) => !used.has(i));
+      map[key] = free >= 0 ? free : Object.keys(map).length % PALETTE.length;
+      try { localStorage.setItem("colors", JSON.stringify(map)); } catch (e) { /* 覚えられなくても動く */ }
+    }
+    return PALETTE[map[key]];
+  };
+})();
 
 function load(key, fallback) { try { return localStorage.getItem(key) || fallback; } catch (e) { return fallback; } }
 function save(key, value) { try { localStorage.setItem(key, value); } catch (e) { /* 保存できなくても動く */ } }
@@ -238,7 +253,7 @@ function renderPie(s) {
     for (const h of s.holdings) byTicker.set(h.name, (byTicker.get(h.name) || 0) + h.value);
     labels = [...byTicker.keys(), "現金"];
     values = [...byTicker.values(), s.cash];
-    colors = labels.map((_, i) => i === labels.length - 1 ? css("--cash") : PALETTE[i % PALETTE.length]);
+    colors = labels.map((name, i) => i === labels.length - 1 ? css("--cash") : colorOf(name));
   } else {
     const sum = (a) => s.holdings.filter((h) => h.account === a).reduce((t, h) => t + h.value, 0);
     labels = ["NISA", "特定口座", "現金"];
@@ -284,8 +299,12 @@ function renderHoldings(s) {
     name.append(badge);
     const meta = document.createElement("div");
     meta.className = "meta";
-    const price = h.price == null ? "株価なし" : `${h.price.toLocaleString("ja-JP", { maximumFractionDigits: 1 })} 円`;
-    meta.textContent = `${h.ticker} ・ ${h.shares.toLocaleString("ja-JP")} 株 ・ ${price}`;
+    if (h.outside) {
+      meta.textContent = "取得額で固定（このアプリでは値動きを追いません）";
+    } else {
+      const price = h.price == null ? "株価なし" : `${h.price.toLocaleString("ja-JP", { maximumFractionDigits: 1 })} 円`;
+      meta.textContent = `${h.ticker} ・ ${h.shares.toLocaleString("ja-JP")} 株 ・ ${price}`;
+    }
     left.append(name, meta);
     const right = document.createElement("div");
     right.className = "right";
@@ -319,7 +338,7 @@ function renderHistory(h) {
   const labels = idx.map((i) => h.dates[i].slice(2).replaceAll("-", "/"));
   let stacks;
   if (state.stack === "ticker") {
-    stacks = h.tickers.map((t, n) => ({ label: t.name, data: pick(t.values), backgroundColor: PALETTE[n % PALETTE.length] }));
+    stacks = h.tickers.map((t) => ({ label: t.name, data: pick(t.values), backgroundColor: colorOf(t.name) }));
   } else {
     stacks = [
       { label: "NISA", data: pick(h.accounts.nisa), backgroundColor: css("--nisa") },

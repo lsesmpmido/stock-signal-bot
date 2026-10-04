@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import time as _time
@@ -141,10 +142,15 @@ class Summary:
     year_fee: float
     started_at: datetime
     topix_change: float | None
+    outside: list[dict] = field(default_factory=list)  # ゲーム外の保有（取得額のまま総資産に含める）
     total_value: float = field(init=False)
 
     def __post_init__(self) -> None:
-        self.total_value = self.cash + sum(h.value if h.value is not None else h.cost for h in self.holdings)
+        self.total_value = (
+            self.cash
+            + sum(h.value if h.value is not None else h.cost for h in self.holdings)
+            + sum(o["cost"] for o in self.outside)
+        )
 
     @property
     def total_return(self) -> float:
@@ -158,6 +164,40 @@ def _year_start(now: datetime) -> datetime:
 async def _settings(owner: str) -> tuple[float, float]:
     s = await db.get_all_settings()
     return float(s[db.CASH_KEYS[owner]]), float(s["vp_fee_rate"])
+
+
+def outside_holdings(settings: dict[str, str], today: date) -> list[dict]:
+    """ゲーム外の保有（米国株など、このアプリで扱えない保有。3 チーム共通）。取得日が today 以前のものだけ。
+
+    値動きは追わず、取得額のまま総資産に含める。初期条件の設定（/reset）で登録する。
+    """
+    try:
+        rows = json.loads(settings.get("vp_outside_holdings") or "[]")
+    except ValueError:
+        log.warning("vp_outside_holdings を読めません: %r", settings.get("vp_outside_holdings"))
+        return []
+    return [{**o, "opened_on": date.fromisoformat(o["opened_on"])} for o in rows if date.fromisoformat(o["opened_on"]) <= today]
+
+
+def start_holdings(settings: dict[str, str]) -> list[dict]:
+    """勝負を始めた時点の保有（初期条件の設定で登録したもの）。取得日は date にする。"""
+    try:
+        rows = json.loads(settings.get("vp_start_holdings") or "[]")
+    except ValueError:
+        return []
+    return [{**h, "opened_on": date.fromisoformat(h["opened_on"])} for h in rows]
+
+
+def invested_since(settings: dict[str, str]) -> date:
+    """軍資金で運用を始めた日。勝負を始めた日と、開始時点の保有・ゲーム外の保有の最も古い取得日のうち早いほう。
+
+    通算の成績（入金額の合計＝軍資金からの増減）は、勝負を始める前の値上がりも含むので、比べる期間もここから。
+    """
+    started = datetime.fromisoformat(settings["vp_started_at"]).astimezone(JST).date()
+    opened = [h["opened_on"] for h in start_holdings(settings)] + [
+        o["opened_on"] for o in outside_holdings(settings, date.max)
+    ]
+    return min([started, *opened])
 
 
 def nisa_preset(settings: dict[str, str], year: int) -> float:
@@ -397,7 +437,8 @@ async def summary(owner: str, refresh: bool = True) -> Summary:
         year_tax=totals["tax"],
         year_fee=totals["fee"],
         started_at=started_at,
-        topix_change=await _topix_change(started_at.astimezone(JST).date(), refresh),
+        topix_change=await _topix_change(invested_since(settings), refresh),
+        outside=outside_holdings(settings, now.date()),
     )
 
 

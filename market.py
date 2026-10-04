@@ -10,6 +10,7 @@ import asyncio
 import logging
 import time
 from datetime import date, datetime, timedelta
+from fractions import Fraction
 from zoneinfo import ZoneInfo
 
 import jpholiday
@@ -27,6 +28,7 @@ MAX_ATTEMPTS = 4
 FULL_HISTORY = "5y"  # 初めて扱う銘柄のダウンロード期間
 RECENT_OVERLAP_DAYS = 7  # 差分取得で、保存済みの最新日からさかのぼる日数
 SPLIT_TOLERANCE = 0.005  # 保存済みの終値と 0.5% 以上ずれたら、株式分割などで過去が修正されたとみなす
+SPLIT_RATIO_TOLERANCE = 0.03  # ずれの比が 1:2 などの分割比から 3% 以内なら、株式分割とみなす
 INDEX_CODES = ("^N225", "1306")  # 日経平均と TOPIX 連動 ETF（TOPIX 指数は yfinance で取れないことが多いため）
 
 
@@ -153,6 +155,31 @@ def _was_restated(stored: dict[date, float], fetched: pd.DataFrame, last_stored:
     return False
 
 
+def _detect_split(stored: dict[date, float], fetched: pd.DataFrame) -> tuple[date, float] | None:
+    """取り直す前と後の終値の比から、分割日（分割後の株価になった最初の日）と分割比を求める。
+
+    分割比は「1 株が何株になるか」（取り直す前の終値 ÷ 取り直した後の終値）。
+    1:2 や 2:3、2:1 の併合のような比にならない修正（データの訂正など）なら None。
+    """
+    closes = {ts.date(): float(c) for ts, c in fetched["Close"].items()}
+    changed = [
+        (d, stored[d] / closes[d])
+        for d in sorted(stored)
+        if closes.get(d) and abs(stored[d] / closes[d] - 1) > SPLIT_TOLERANCE
+    ]
+    if not changed:
+        return None
+    rates = sorted(r for _, r in changed)
+    rate = rates[len(rates) // 2]
+    ratio = Fraction(rate).limit_denominator(10)
+    if ratio == 1 or abs(rate / float(ratio) - 1) > SPLIT_RATIO_TOLERANCE:
+        return None
+    later = [d for d in sorted(closes) if d > changed[-1][0]]
+    if not later:
+        return None
+    return later[0], float(ratio)
+
+
 def _download_groups(coverage: dict[str, date]) -> dict[date, list[str]]:
     """差分取得の開始日ごとに、まとめてダウンロードする銘柄を分ける。
 
@@ -206,6 +233,13 @@ async def get_daily(codes: list[str], years: int = 2, refresh: bool = True) -> d
             log.info("過去の株価が修正されていたため取り直します（株式分割など）: %s", restated)
             full = await asyncio.to_thread(_download_sync, restated, period=FULL_HISTORY)
             for code, df in full.items():
+                # 先に保有などを直す。日足の入れ替えが失敗しても次回また検出され、分割は二重には反映されない
+                if split := _detect_split(stored.get(code, {}), df):
+                    ex_date, ratio = split
+                    if (detail := await db.apply_split(code, ex_date, ratio)) is not None:
+                        log.info("株式分割を反映しました: %s %s 1:%g %s", code, ex_date, ratio, detail)
+                else:
+                    log.warning("過去の株価が修正されましたが、分割比を判定できませんでした（保有は直しません）: %s", code)
                 await db.replace_prices(code, _to_rows(code, df))
 
     since = now_jst().date() - timedelta(days=366 * years)

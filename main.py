@@ -432,6 +432,32 @@ class StockBot(ext_commands.Bot):
         except Exception:  # 起動時にも呼ばれるので、通知の失敗で Bot を止めない
             log.exception("自動解除の通知に失敗しました")
 
+    async def notify_splits(self) -> None:
+        """株式分割に合わせて直した保有・注文・アラートを知らせる（直したものがない分割は知らせない）。"""
+        for event in await db.unnotified_splits():
+            detail = event["detail"]
+            lines = [
+                f"・{portfolio.OWNER_LABELS.get(p['owner'], p['owner'])}の{portfolio.ACCOUNT_LABELS[p['account']]}: "
+                f"{p['before']:,} 株 → {p['after']:,} 株"
+                for p in detail["positions"]
+            ]
+            lines += [f"・未約定の売り注文 #{o['id']}: {o['before']:,} 株 → {o['after']:,} 株" for o in detail["orders"]]
+            lines += [f"・価格アラート #{a['id']}: {a['before']:,.1f} 円 → {a['after']:,.1f} 円" for a in detail["alerts"]]
+            if lines:
+                info = self.master.get(event["ticker"])
+                name = info.name if info else event["ticker"]
+                ratio = event["ratio"]
+                embed = discord.Embed(
+                    title=f"✂️ {name} ({event['ticker']}) の株式{'分割' if ratio > 1 else '併合'}を反映しました",
+                    description=f"{event['ex_date']:%Y/%m/%d} から 1 株 → {ratio:g} 株\n" + "\n".join(lines),
+                    color=discord.Color.light_grey(),
+                )
+                embed.set_footer(text="取得額の合計は変わりません。株価の変化から判定した分割比です")
+                channel = await self._report_channel()
+                await channel.send(embed=embed)
+                await db.log_notification("split", event["ticker"], f"1:{ratio:g}")
+            await db.mark_split_notified(event["ticker"], event["ex_date"])
+
     # ------------------------------------------------------------ モジュール1・2: 新銘柄提案
 
     async def run_proposal_job(self, settings: dict[str, str]) -> dict[str, int]:
@@ -589,6 +615,10 @@ class StockBot(ext_commands.Bot):
         daily = await market.get_daily(codes)
         pruned = await market.prune_old_prices()
         log.info("日足を保存しました (%d / %d 銘柄、古い日足 %d 行を削除)", len(daily), len(set(codes)), pruned)
+        try:
+            await self.notify_splits()
+        except Exception:
+            log.exception("株式分割の通知に失敗しました")
         await self.save_snapshots()
         try:
             await self.run_ai_trader()

@@ -231,6 +231,16 @@ CREATE TABLE IF NOT EXISTS price_daily (
     volume BIGINT,
     PRIMARY KEY (ticker, date)
 );
+-- 反映した株式分割（同じ分割を二重に反映しないため。notified_at は通知済みの日時）
+CREATE TABLE IF NOT EXISTS split_events (
+    ticker      TEXT NOT NULL,
+    ex_date     DATE NOT NULL,  -- 分割後の株価になった最初の日
+    ratio       DOUBLE PRECISION NOT NULL,  -- 1 株が何株になるか（1:2 の分割なら 2、2:1 の併合なら 0.5）
+    detail      JSONB NOT NULL,  -- 直した保有・注文・アラート
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    notified_at TIMESTAMPTZ,
+    PRIMARY KEY (ticker, ex_date)
+);
 -- テーブルを REST API などで外部公開するサービスでも第三者に読み書きされないよう、RLS を有効化しておく。
 -- (Bot はテーブル所有者のロールで接続するので RLS の影響を受けない)
 ALTER TABLE pending_stocks   ENABLE ROW LEVEL SECURITY;
@@ -249,6 +259,7 @@ ALTER TABLE ai_decisions     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE news_judgements  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE quizzes          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE fiscal_ends      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE split_events     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE quiz_answers     ENABLE ROW LEVEL SECURITY;
 """
 
@@ -548,6 +559,87 @@ async def replace_prices(ticker: str, rows: list[PriceRow]) -> None:
                     "INSERT INTO price_daily (ticker, date, open, high, low, close, volume) VALUES (%s, %s, %s, %s, %s, %s, %s)",
                     rows,
                 )
+
+
+async def apply_split(ticker: str, ex_date: date, ratio: float) -> dict[str, Any] | None:
+    """株式分割（併合）を、分割日より前からある保有・未約定の売り注文・価格アラートに反映する。
+
+    日足は分割後の基準に取り直されるので、株数と価格をそれに合わせる（取得額の合計は変えない）。
+    同じ分割は 1 回だけ反映し、反映済みなら None を返す。すべて 1 つのトランザクションで行う。
+    """
+    start = datetime(ex_date.year, ex_date.month, ex_date.day, tzinfo=timezone(timedelta(hours=9)))
+    detail: dict[str, Any] = {"positions": [], "orders": [], "alerts": []}
+    async with _pool_or_raise().connection() as conn:
+        async with conn.transaction():
+            cur = await conn.execute(
+                "INSERT INTO split_events (ticker, ex_date, ratio, detail) VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT DO NOTHING RETURNING ticker",
+                (ticker, ex_date, ratio, Jsonb(detail)),
+            )
+            if await cur.fetchone() is None:
+                return None
+            positions = await (
+                await conn.execute(
+                    "SELECT * FROM vp_positions WHERE ticker = %s AND opened_at < %s FOR UPDATE", (ticker, start)
+                )
+            ).fetchall()
+            for p in positions:
+                # 分割日以降に買い足した分は、すでに分割後の株数なので直さない
+                row = await (
+                    await conn.execute(
+                        "SELECT COALESCE(SUM(shares), 0) AS shares FROM vp_trades "
+                        "WHERE owner = %s AND account = %s AND ticker = %s AND side = 'buy' AND traded_at >= %s",
+                        (p["owner"], p["account"], ticker, start),
+                    )
+                ).fetchone()
+                before = max(0, p["shares"] - int(row["shares"]))
+                shares = int(before * ratio + 1e-9) + (p["shares"] - before)  # 併合の端数は切り捨てる
+                if shares == p["shares"]:
+                    continue
+                await conn.execute(
+                    "UPDATE vp_positions SET shares = %s WHERE owner = %s AND account = %s AND ticker = %s",
+                    (shares, p["owner"], p["account"], ticker),
+                )
+                detail["positions"].append(
+                    {"owner": p["owner"], "account": p["account"], "before": p["shares"], "after": shares}
+                )
+            orders = await (
+                await conn.execute(
+                    "UPDATE vp_orders o SET shares = FLOOR(o.shares * %s + 1e-9)::int FROM vp_orders old "
+                    "WHERE o.id = old.id AND o.ticker = %s AND o.status = 'open' AND o.shares IS NOT NULL "
+                    "AND o.created_at < %s RETURNING o.id, o.owner, old.shares AS before, o.shares AS after",
+                    (ratio, ticker, start),
+                )
+            ).fetchall()
+            detail["orders"] = orders
+            alerts = await (
+                await conn.execute(
+                    "UPDATE price_alerts a SET target = a.target / %s, base_high = a.base_high / %s, "
+                    "base_low = a.base_low / %s FROM price_alerts old "
+                    "WHERE a.id = old.id AND a.ticker = %s AND a.active AND a.created_at < %s "
+                    "RETURNING a.id, old.target AS before, a.target AS after",
+                    (ratio, ratio, ratio, ticker, start),
+                )
+            ).fetchall()
+            detail["alerts"] = alerts
+            await conn.execute(
+                "UPDATE split_events SET detail = %s WHERE ticker = %s AND ex_date = %s", (Jsonb(detail), ticker, ex_date)
+            )
+    return detail
+
+
+async def unnotified_splits() -> list[dict[str, Any]]:
+    async with _pool_or_raise().connection() as conn:
+        return await (
+            await conn.execute("SELECT * FROM split_events WHERE notified_at IS NULL ORDER BY applied_at")
+        ).fetchall()
+
+
+async def mark_split_notified(ticker: str, ex_date: date) -> None:
+    async with _pool_or_raise().connection() as conn:
+        await conn.execute(
+            "UPDATE split_events SET notified_at = now() WHERE ticker = %s AND ex_date = %s", (ticker, ex_date)
+        )
 
 
 async def prune_prices(before: date) -> int:

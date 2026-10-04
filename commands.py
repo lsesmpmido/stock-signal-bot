@@ -714,21 +714,25 @@ async def map_command(interaction: discord.Interaction, private: bool = False) -
 
 
 def setup(tree: app_commands.CommandTree) -> None:
-    tree.add_command(settings_command)
-    tree.add_command(WatchGroup())
-    tree.add_command(AlertGroup())
-    tree.add_command(TestGroup())
-    tree.add_command(buy_command)
-    tree.add_command(sell_command)
-    tree.add_command(portfolio_command)
-    tree.add_command(orders_command)
-    tree.add_command(battle_command)
-    tree.add_command(deposit_command)
-    tree.add_command(reset_command)
-    tree.add_command(chart_command)
-    tree.add_command(ranking_command)
-    tree.add_command(compare_command)
-    tree.add_command(related_command)
-    tree.add_command(map_command)
-    tree.add_command(sentiment_command)
-    tree.add_command(review_command)
+    for command in (
+        settings_command,
+        WatchGroup(),
+        AlertGroup(),
+        TestGroup(),
+        buy_command,
+        sell_command,
+        portfolio_command,
+        orders_command,
+        battle_command,
+        deposit_command,
+        reset_command,
+        chart_command,
+        ranking_command,
+        compare_command,
+        related_command,
+        map_command,
+        sentiment_command,
+        review_command,
+    ):
+        # DM には出さない（default_permissions は DM では効かないため）。実行時の確認は access.Tree で行う
+        tree.add_command(app_commands.guild_only(command))

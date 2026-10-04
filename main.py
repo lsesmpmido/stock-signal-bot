@@ -19,6 +19,7 @@ from discord.ext import commands as ext_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 
+import access
 import ai_trader
 import battle
 import charts
@@ -168,7 +169,9 @@ def due_slot(slots: list[datetime], now: datetime) -> str | None:
 
 class StockBot(ext_commands.Bot):
     def __init__(self) -> None:
-        super().__init__(command_prefix=ext_commands.when_mentioned, intents=discord.Intents.default())
+        super().__init__(
+            command_prefix=ext_commands.when_mentioned, intents=discord.Intents.default(), tree_cls=access.Tree
+        )
         self.master = TickerMaster()
         self.relations = RelationGraph()
         self.jev: JevJudge | None = None

@@ -14,6 +14,7 @@ import pandas as pd
 
 import discord
 
+import access
 import db
 import ai_trader
 import battle
@@ -124,7 +125,14 @@ def _with_footer(message: discord.Message, text: str) -> discord.Embed | None:
     return embed
 
 
-class AddPendingButton(discord.ui.DynamicItem[discord.ui.Button], template=r"pending:add:(?P<id>[0-9]+)"):
+class _AdminOnly:
+    """状態を変えるボタン用。チャンネルの誰でも押せてしまうので、押した人がコマンドと同じ権限を持つかを確かめる。"""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await access.check(interaction)
+
+
+class AddPendingButton(_AdminOnly, discord.ui.DynamicItem[discord.ui.Button], template=r"pending:add:(?P<id>[0-9]+)"):
     def __init__(self, pending_id: int) -> None:
         super().__init__(
             discord.ui.Button(
@@ -160,7 +168,7 @@ class AddPendingButton(discord.ui.DynamicItem[discord.ui.Button], template=r"pen
         await interaction.response.edit_message(embed=_with_footer(interaction.message, note), view=decided_view(code))
 
 
-class SkipPendingButton(discord.ui.DynamicItem[discord.ui.Button], template=r"pending:skip:(?P<id>[0-9]+)"):
+class SkipPendingButton(_AdminOnly, discord.ui.DynamicItem[discord.ui.Button], template=r"pending:skip:(?P<id>[0-9]+)"):
     def __init__(self, pending_id: int) -> None:
         super().__init__(
             discord.ui.Button(
@@ -189,7 +197,7 @@ class SkipPendingButton(discord.ui.DynamicItem[discord.ui.Button], template=r"pe
         )
 
 
-class UnwatchButton(discord.ui.DynamicItem[discord.ui.Button], template=r"watch:remove:(?P<code>[0-9A-Z]+)"):
+class UnwatchButton(_AdminOnly, discord.ui.DynamicItem[discord.ui.Button], template=r"watch:remove:(?P<code>[0-9A-Z]+)"):
     def __init__(self, code: str) -> None:
         super().__init__(
             discord.ui.Button(
@@ -301,7 +309,7 @@ def quiz_answer_embed(q: dict, answers: list[dict]) -> discord.Embed:
     return embed
 
 
-class VirtualBuyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"vp:buy:(?P<code>[0-9A-Z]+)"):
+class VirtualBuyButton(_AdminOnly, discord.ui.DynamicItem[discord.ui.Button], template=r"vp:buy:(?P<code>[0-9A-Z]+)"):
     def __init__(self, code: str) -> None:
         super().__init__(
             discord.ui.Button(
@@ -809,7 +817,7 @@ def related_tree_embed(
 DEPOSIT_CHOICES = [(2_400_000, "240万円"), (1_200_000, "120万円"), (0, "入金しない")]
 
 
-class DepositButton(discord.ui.DynamicItem[discord.ui.Button], template=r"deposit:(?P<amount>[0-9]+)"):
+class DepositButton(_AdminOnly, discord.ui.DynamicItem[discord.ui.Button], template=r"deposit:(?P<amount>[0-9]+)"):
     def __init__(self, amount: int) -> None:
         label = dict(DEPOSIT_CHOICES).get(amount, f"{amount:,} 円")
         super().__init__(
@@ -1057,7 +1065,7 @@ class SkipReasonView(discord.ui.View):
         self.add_item(_SkipReasonSelect(pending_id))
 
 
-class PruneButton(discord.ui.DynamicItem[discord.ui.Button], template=r"prune:(?P<action>keep|remove):(?P<code>[0-9A-Z]+)"):
+class PruneButton(_AdminOnly, discord.ui.DynamicItem[discord.ui.Button], template=r"prune:(?P<action>keep|remove):(?P<code>[0-9A-Z]+)"):
     """週末の整理タイムの「続ける」「外す」ボタン。"""
 
     def __init__(self, action: str, code: str, name: str = "") -> None:

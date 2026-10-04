@@ -56,8 +56,9 @@ SLOT_GRACE = timedelta(minutes=10)
 PROPOSAL_TIMES = {"twice": [time(8, 30), time(16, 0)], "once": [time(8, 30)]}
 # 東証のデータは約 20 分遅れるため、場中の時刻を少し後ろにずらして実行する
 SESSIONS = [(time(9, 15), time(11, 45)), (time(12, 45), time(15, 45))]
-HOURLY_TIMES = [time(h) for h in (10, 11, 12, 13, 14, 15)] + [time(15, 45)]
-CLOSE_TIME = time(15, 45)
+# 大引け後の判定。15:30 の終値（クロージング・オークション）が約 20 分遅れで届いた後にする
+CLOSE_TIME = time(15, 55)
+HOURLY_TIMES = [time(h) for h in (10, 11, 12, 13, 14, 15)] + [CLOSE_TIME]
 # 大引け後、確定した日足を DB に保存する時刻（データの遅れを見込んで少し遅らせる）
 PRICE_SYNC_TIME = time(16, 0)
 # 答え合わせなどで後から株価を使うため、直近この日数に提案した銘柄の日足も保存しておく
@@ -87,7 +88,7 @@ def signal_slots(freq: str, day: datetime) -> list[datetime]:
             while t <= datetime.combine(d, end, JST):
                 slots.append(t)
                 t += timedelta(minutes=15)
-        return slots
+        return slots + [datetime.combine(d, CLOSE_TIME, JST)]
     if freq == "1h":
         return [datetime.combine(d, t, JST) for t in HOURLY_TIMES]
     if freq == "close":

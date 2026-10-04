@@ -38,7 +38,7 @@ PROPOSAL_OPTIONS = [
 SIGNAL_OPTIONS = [
     ("15m", "15分間隔 (場中)"),
     ("1h", "1時間間隔 (場中)"),
-    ("close", "1日1回 (大引け後 15:45)"),
+    ("close", "1日1回 (大引け後 15:55)"),
     ("off", "OFF"),
 ]
 SOURCE_LABELS = {"proposal": "提案から", "manual": "手動"}

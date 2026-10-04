@@ -65,8 +65,6 @@ PRICE_SYNC_PROPOSAL_DAYS = 35
 # 定番レポートの時刻。朝は 8:30 の提案ジョブの後、大引けは 16:00 の日足保存の後にする
 # 取引時間外に出た注文を始値で約定させる時刻。データの遅れで始値がまだ取れない銘柄は次の時刻に回す
 FILL_TIMES = [time(9, 30), time(10, 0), time(11, 0), time(13, 0)]
-DEFAULT_DEPOSIT = 2_400_000
-DEPOSIT_PROMPT = (12, 20, time(10, 0))  # 12 月 20 日 10:00 に、来年の入金額を確認するお知らせを送る
 # 週末の整理タイム（土曜 10:00）
 CLEANUP_TIME = time(10, 0)
 QUIZ_TIME = time(12, 0)  # 銘柄当てクイズ（取引日。前回の答えを発表してから出題する）
@@ -183,7 +181,6 @@ class StockBot(ext_commands.Bot):
         self._price_sync_lock = asyncio.Lock()
         self._report_lock = asyncio.Lock()
         self._fill_lock = asyncio.Lock()
-        self._deposit_lock = asyncio.Lock()
         self._alert_lock = asyncio.Lock()
         self._hot_lock = asyncio.Lock()
         self._fiscal_lock = asyncio.Lock()
@@ -206,7 +203,6 @@ class StockBot(ext_commands.Bot):
             views.VirtualBuyButton,
             views.WhyButton,
             views.QuizButton,
-            views.DepositButton,
             views.PruneButton,
         )
         commands.setup(self.tree)
@@ -277,16 +273,6 @@ class StockBot(ext_commands.Bot):
         if slot and slot != settings.get("_last_fill_slot") and not self._fill_lock.locked():
             await db.set_setting("_last_fill_slot", slot)
             self._spawn(self._guarded(self._fill_lock, self.run_fill_job))
-
-        # 追加入金: 12 月 20 日に金額を確認し、1 月 1 日に入金する
-        month, day, at = DEPOSIT_PROMPT
-        prompted = settings.get("_last_deposit_prompt") == str(now.year)
-        if (now.month, now.day) == (month, day) and now.time() >= at and not prompted:
-            await db.set_setting("_last_deposit_prompt", str(now.year))
-            self._spawn(self._guarded(self._deposit_lock, self.send_deposit_prompt))
-        if now.year > int(settings.get("_last_deposit_year") or now.year) and not self._deposit_lock.locked():
-            await db.set_setting("_last_deposit_year", str(now.year))
-            self._spawn(self._guarded(self._deposit_lock, self.run_deposit, settings))
 
         slot = due_slot(alert_slots(now), now)
         if slot and slot != settings.get("_last_alert_slot") and not self._alert_lock.locked():
@@ -783,32 +769,20 @@ class StockBot(ext_commands.Bot):
         await (await self._report_channel()).send(embed=embed, view=view)
         await db.log_notification("cleanup", detail=",".join(c.ticker for c in candidates))
 
-    # ------------------------------------------------------------ 追加入金
+    # ------------------------------------------------------------ 入金
 
-    async def send_deposit_prompt(self) -> None:
-        next_year = market.now_jst().year + 1
+    async def deposit(self, amount: float) -> None:
+        """自分と AI に同じ額を入金し、レポート用チャンネルに知らせる（/deposit から呼ぶ）。"""
+        await db.vp_deposit(amount)
+        total = float((await db.get_all_settings())[db.DEPOSIT_KEYS["you"]])
         embed = discord.Embed(
-            title=f"💴 {next_year} 年の追加入金額を決めてください",
+            title="💴 入金しました",
             description=(
-                f"{next_year} 年 1 月 1 日に、あなたと AI の仮想口座へ同じ額を入金します（新NISA の枠も 240 万円に戻ります）。\n"
-                "下のボタンか `/deposit <金額(万円)>` で指定してください。指定がなければ **240 万円** を入金します。"
+                f"あなたと AI の仮想口座に **{amount:,.0f} 円** ずつ入金しました。\n入金額の合計は {total:,.0f} 円です。"
             ),
             color=discord.Color.gold(),
         )
-        await (await self._report_channel()).send(embed=embed, view=views.deposit_view())
-        await db.log_notification("deposit", detail="prompt")
-
-    async def run_deposit(self, settings: dict[str, str]) -> None:
-        amount = float(settings.get("vp_next_deposit") or DEFAULT_DEPOSIT)
-        for owner in portfolio.OWNER_LABELS:
-            if amount > 0:
-                await db.vp_deposit(owner, amount)
-        await db.set_setting("vp_next_deposit", "")
-        embed = discord.Embed(
-            title=f"💴 {market.now_jst().year} 年の追加入金をしました",
-            description=f"あなたと AI の仮想口座に **{amount:,.0f} 円** ずつ入金しました。今年の NISA の枠は 240 万円です。",
-            color=discord.Color.gold(),
-        )
+        embed.set_footer(text="成績は入金額の合計に対する損益で計算します（月ごとの勝敗では、その月の入金分を除きます）")
         await (await self._report_channel()).send(embed=embed)
         await db.log_notification("deposit", detail=f"{amount:.0f}")
 

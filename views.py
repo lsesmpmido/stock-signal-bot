@@ -812,34 +812,7 @@ def related_tree_embed(
     return embed
 
 
-# ---------------------------------------------------------------- 追加入金・AI との勝負
-
-DEPOSIT_CHOICES = [(2_400_000, "240万円"), (1_200_000, "120万円"), (0, "入金しない")]
-
-
-class DepositButton(_AdminOnly, discord.ui.DynamicItem[discord.ui.Button], template=r"deposit:(?P<amount>[0-9]+)"):
-    def __init__(self, amount: int) -> None:
-        label = dict(DEPOSIT_CHOICES).get(amount, f"{amount:,} 円")
-        super().__init__(
-            discord.ui.Button(label=label, style=discord.ButtonStyle.primary, custom_id=f"deposit:{amount}")
-        )
-        self.amount = amount
-
-    @classmethod
-    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match) -> Any:
-        return cls(int(match["amount"]))
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await db.set_setting("vp_next_deposit", str(self.amount))
-        await interaction.response.send_message(f"✅ 次回の追加入金を **{self.amount:,} 円** にしました。", ephemeral=True)
-
-
-def deposit_view() -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
-    for amount, _ in DEPOSIT_CHOICES:
-        view.add_item(DepositButton(amount))
-    return view
-
+# ---------------------------------------------------------------- AI との勝負
 
 def battle_embed(st: battle.Standing, you: portfolio.Summary, ai: portfolio.Summary) -> discord.Embed:
     wins, losses, draws = st.record()

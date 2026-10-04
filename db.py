@@ -31,13 +31,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "report_thread": "on",  # 週末の振り返りスレッド
     "watch_limit": "10",  # 監視できる銘柄数の上限
     # 仮想売買
-    "vp_cash": "2400000",  # 自分の現金残高（円）。元手は新NISA 成長投資枠の年間上限と同じ 240 万円
+    "vp_cash": "2400000",  # 自分の現金残高（円）。軍資金は新NISA 成長投資枠の年間上限と同じ 240 万円
     "vp_cash_ai": "2400000",  # AI の現金残高（円）
     "vp_deposits_you": "2400000",  # 入金額の合計（円）。成績は入金額の合計に対する損益で計算する
     "vp_deposits_ai": "2400000",
     "vp_fee_rate": "0",  # 売買手数料（売買代金に対する割合。例: 0.0022 = 0.22%）
     "vp_default_amount": "200000",  # 金額を省略したときの購入額（円）
-    "vp_next_deposit": "",  # 次回（1 月 1 日）の追加入金額（円）。空なら 240 万円
     "vp_nisa_preset": "",  # 勝負を始める前に使った NISA 枠（"年:円"）。その年の NISA 枠の残りから差し引く
 }
 
@@ -289,12 +288,11 @@ async def init() -> None:
     await _pool.open(wait=True, timeout=30)
     async with _pool.connection() as conn:
         await conn.execute(SCHEMA_SQL)
-        initial = {
-            **DEFAULT_SETTINGS,
-            "vp_started_at": datetime.now(timezone.utc).isoformat(),
-            # 始めた年はすでに元手を入れているので、次の追加入金は翌年 1 月から
-            "_last_deposit_year": str(datetime.now(timezone(timedelta(hours=9))).year),
-        }
+        initial = {**DEFAULT_SETTINGS, "vp_started_at": datetime.now(timezone.utc).isoformat()}
+        # 毎年 1 月 1 日に入金していた頃の設定（今は /deposit でいつでも入金する）
+        await conn.execute(
+            "DELETE FROM user_settings WHERE key IN ('vp_next_deposit', '_last_deposit_year', '_last_deposit_prompt')"
+        )
         for key, value in initial.items():
             await conn.execute(
                 "INSERT INTO user_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING",
@@ -740,11 +738,11 @@ async def vp_record_trade(
                 )
 
 
-async def vp_deposit(owner: str, amount: float) -> None:
-    """現金を入金し、入金額の合計も増やす。"""
+async def vp_deposit(amount: float) -> None:
+    """全チーム（自分と AI）に同じ額の現金を入金し、入金額の合計も増やす。勝負の条件をそろえるため、1 つのトランザクションで行う。"""
     async with _pool_or_raise().connection() as conn:
         async with conn.transaction():
-            for key in (CASH_KEYS[owner], DEPOSIT_KEYS[owner]):
+            for key in (*CASH_KEYS.values(), *DEPOSIT_KEYS.values()):
                 await conn.execute(
                     "UPDATE user_settings SET value = (value::double precision + %s)::text WHERE key = %s",
                     (amount, key),

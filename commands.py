@@ -432,13 +432,14 @@ async def battle_command(interaction: discord.Interaction) -> None:
     await interaction.followup.send(embed=views.battle_embed(st, you, ai))
 
 
-@app_commands.command(name="deposit", description="次回（1 月 1 日）の追加入金額を指定します（あなたと AI に同じ額）")
-@app_commands.describe(amount="入金額（万円）。0 なら入金しない")
+@app_commands.command(name="deposit", description="仮想口座に入金します（あなたと AI に同じ額。いつでも入金できます）")
+@app_commands.describe(amount="入金額（万円）")
 @app_commands.default_permissions(manage_guild=True)
-async def deposit_command(interaction: discord.Interaction, amount: app_commands.Range[float, 0, 100000]) -> None:
+async def deposit_command(interaction: discord.Interaction, amount: app_commands.Range[float, 0.01, 100000.0]) -> None:
     yen = round(amount * 10_000)
-    await db.set_setting("vp_next_deposit", str(yen))
-    await interaction.response.send_message(f"✅ 次回（1 月 1 日）の追加入金を **{yen:,} 円** にしました。", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction.client.deposit(yen)
+    await interaction.followup.send(f"✅ あなたと AI に **{yen:,} 円** ずつ入金しました。", ephemeral=True)
 
 
 @app_commands.command(name="reset", description="現金・すでに持っている銘柄を指定して、AI との勝負を同じ条件でやり直します")

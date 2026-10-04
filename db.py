@@ -175,7 +175,7 @@ CREATE TABLE IF NOT EXISTS news_judgements (
     ticker      TEXT NOT NULL,
     news_url    TEXT NOT NULL,
     news_title  TEXT NOT NULL,
-    kind        TEXT NOT NULL,  -- news（ニュースの当事者）/ related（関連銘柄）/ watch（監視銘柄のニュース）
+    kind        TEXT NOT NULL,  -- news（ニュースの当事者）/ related（関連銘柄）/ watch（監視銘柄のニュース）/ ask（/ask で判定）
     is_positive DOUBLE PRECISION NOT NULL,
     impact      DOUBLE PRECISION NOT NULL,
     category    TEXT,

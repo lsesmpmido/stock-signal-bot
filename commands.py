@@ -1,4 +1,4 @@
-"""スラッシュコマンド: /settings, /watch add|remove|list|memo|star|tag, /alert add|list|remove, /buy, /sell, /portfolio, /orders, /battle, /deposit, /reset, /chart, /ranking, /compare, /related, /map, /sentiment, /review, /dashboard, /test proposal|signal|report"""
+"""スラッシュコマンド: /settings, /watch add|remove|list|memo|star|tag, /alert add|list|remove, /buy, /sell, /portfolio, /orders, /battle, /deposit, /reset, /chart, /ranking, /compare, /related, /map, /sentiment, /review, /dashboard, /ask, /test proposal|signal|report"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import discord
 import pandas as pd
 from discord import app_commands
 
+import advisor
 import battle
 import charts
 import dashboard
@@ -677,6 +678,24 @@ async def sentiment_command(interaction: discord.Interaction, code: str, private
     await _run(interaction, private, body)
 
 
+@app_commands.command(name="ask", description="その銘柄が今買い時か売り時かを、記事と RSI・MACD などの値動きから判定します")
+@app_commands.describe(code="証券コード（例: 7203）", private=PRIVATE_DESC)
+@app_commands.default_permissions(manage_guild=True)
+async def ask_command(interaction: discord.Interaction, code: str, private: bool = False) -> None:
+    async def body():
+        c, name = await _resolve(interaction, code)
+        try:
+            advice = await advisor.advise(interaction.client.jev, c, name, market.now_jst())
+        except advisor.AdviceError as exc:
+            raise CommandError(str(exc)) from None
+        png = await asyncio.to_thread(charts.detailed_chart, c, name, advice.ind)
+        embed = views.advice_embed(advice)
+        embed.set_image(url=f"attachment://{c}_ask.png")
+        return {"embed": embed, "file": discord.File(png, filename=f"{c}_ask.png")}
+
+    await _run(interaction, private, body)
+
+
 MAP_NEIGHBORS = 4  # 関係図で、1 銘柄あたりに出す関連企業の数
 MAP_PRIMARY = 10  # 関係図に出す監視・保有銘柄の数
 
@@ -768,6 +787,7 @@ def setup(tree: app_commands.CommandTree) -> None:
         sentiment_command,
         review_command,
         dashboard_command,
+        ask_command,
     ):
         # DM には出さない（default_permissions は DM では効かないため）。実行時の確認は access.Tree で行う
         tree.add_command(app_commands.guild_only(command))

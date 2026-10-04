@@ -15,6 +15,7 @@ import pandas as pd
 import discord
 
 import access
+import advisor
 import db
 import ai_trader
 import battle
@@ -824,6 +825,75 @@ def related_tree_embed(
         + "\n👀 監視中　💰 仮想で保有中"
     )
     embed.set_footer(text="関係データ: JP Market Vis（EDINET 等から自動抽出。誤りを含む場合があります）")
+    return embed
+
+
+# ---------------------------------------------------------------- /ask（買い時・売り時の判定）
+
+IMPACT_WORDS = ["小", "中", "大"]
+
+
+def _rsi_word(rsi: float | None) -> str:
+    if rsi is None:
+        return ""
+    return "（売られすぎ）" if rsi <= 30 else "（買われすぎ）" if rsi >= 70 else "（中立）"
+
+
+def advice_embed(a: advisor.Advice) -> discord.Embed:
+    f, m = a.features, a.macd
+    asked = "売るべきか（保有中）" if a.question == "sell" else "買うべきか"
+    embed = discord.Embed(
+        title=f"🔎 {a.name} ({a.code}) の判定: {a.verdict}",
+        description=f"Jev の「今{asked}」の確信度: **{a.confidence:.0%}**"
+        f"（{advisor.HIGH:.0%} 以上で{'売り時' if a.question == 'sell' else '買い時'}、"
+        f"{advisor.LOW:.0%} 以下で{'持ち続け' if a.question == 'sell' else '見送り'}）",
+        color=a.color,
+    )
+    lines = []
+    if f.get("rsi") is not None:
+        lines.append(f"RSI(14): {f['rsi']:.0f}{_rsi_word(f['rsi'])}")
+    if m["macd"] is not None and m["signal"] is not None:
+        side = "MACD がシグナル線の上（上向き）" if m["diff"] > 0 else "MACD がシグナル線の下（下向き）"
+        cross = ""
+        if c := m["recent_cross"]:
+            when = "今日" if c["bars_ago"] == 0 else f"{c['bars_ago']} 営業日前"
+            cross = f" ・ {when}に{'ゴールデンクロス' if c['type'] == 'golden' else 'デッドクロス'}"
+        lines.append(f"MACD {m['macd']:+,.2f} / シグナル {m['signal']:+,.2f}（{side}、差 {m['diff']:+,.2f}）{cross}")
+    gaps = [
+        f"{label}から {f[key]:+.1%}" for key, label in (("ma25_gap", "25日線"), ("ma75_gap", "75日線")) if f.get(key) is not None
+    ]
+    if gaps:
+        lines.append("移動平均: " + " ・ ".join(gaps))
+    changes = [f"{label} {f[key]:+.1%}" for key, label in (("change_5d", "5日"), ("change_20d", "20日")) if f.get(key) is not None]
+    if changes:
+        lines.append(f"騰落: {' ・ '.join(changes)} ・ 終値 {f['close']:,.1f} 円")
+    embed.add_field(name="📈 値動き", value="\n".join(lines)[:1024] or "—", inline=False)
+
+    if a.articles:
+        avg = sum(x["is_positive"] for x in a.articles) / len(a.articles)
+        head = f"直近 {advisor.NEWS_DAYS} 日の記事 {len(a.articles)} 件 ・ プラス材料の確率の平均 {avg:.0%}"
+        if a.new_articles:
+            head += f"（今回 {a.new_articles} 件を新しく判定）"
+        rows = [
+            f"・{x['is_positive']:.0%} 影響 {IMPACT_WORDS[min(2, max(0, round(x['impact'])))]} "
+            f"{CATEGORIES.get(x['category'], CATEGORIES['other'])[0]} [{x['news_title'][:50]}]({x['news_url']})"
+            for x in a.articles[:6]
+        ]
+        embed.add_field(name="📰 ニュース", value=_field_lines([head, *rows], len(a.articles) - 6), inline=False)
+    else:
+        embed.add_field(name="📰 ニュース", value=f"直近 {advisor.NEWS_DAYS} 日に、この社名の記事は見つかりませんでした。", inline=False)
+
+    if h := a.holding:
+        accounts = "・".join(portfolio.ACCOUNT_LABELS[x] for x in h["accounts"])
+        embed.add_field(
+            name="💼 あなたの保有",
+            value=f"{h['shares']:,} 株（{accounts}） ・ 含み損益 {_yen(h['value'] - h['cost'], sign=True)}（{h['return_rate']:+.1%}）"
+            f" ・ 保有 {h['held_trading_days']} 営業日",
+            inline=False,
+        )
+    embed.set_footer(
+        text="投資助言ではありません。Jev による自動判定です。Jev は理由の文章を返さないため、判断に使った材料を表示しています。株価は約 20 分遅れ"
+    )
     return embed
 
 

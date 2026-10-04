@@ -189,10 +189,11 @@ class AlertGroup(
             if price == now:
                 raise CommandError(f"今の株価（{now:,.1f} 円）と同じ価格は指定できません。")
             direction = "above" if price > now else "below"
-            # 今日の日足があれば、その時点の高値・安値を残す（今日すでについた値でアラートが鳴らないようにする）
+            # 今日の日足があれば、その時点の高値・安値を残す（今日すでについた値でアラートが鳴らないようにする）。
+            # まだなければ（寄り付き前など）今の株価を残し、作った日の値動きも判定に使う
             today = df.index[-1].date() == market.now_jst().date()
-            base_high = float(df["High"].iloc[-1]) if today else None
-            base_low = float(df["Low"].iloc[-1]) if today else None
+            base_high = float(df["High"].iloc[-1]) if today else now
+            base_low = float(df["Low"].iloc[-1]) if today else now
             alert_id = await db.add_alert(c, name, price, direction, interaction.user.id, base_high, base_low)
             word = "超えたら" if direction == "above" else "割ったら"
             text = f"⏰ #{alert_id} {name} ({c}) が {price:,.1f} 円を{word}お知らせします（今 {now:,.1f} 円）。"

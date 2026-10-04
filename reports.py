@@ -266,7 +266,8 @@ async def weekly_look_back(now: datetime) -> discord.Embed:
     embed = discord.Embed(
         title=f"📝 今週の振り返り（{week_start:%m/%d}〜{now - timedelta(days=1):%m/%d}）", color=discord.Color.blurple()
     )
-    for owner, label in (("you", "🧑 あなたの売買"), ("ai", "🤖 AI の売買")):
+    for owner in battle.TEAMS:
+        label = f"{portfolio.OWNER_ICONS[owner]} {portfolio.OWNER_LABELS[owner]}の売買"
         trades = await db.vp_trades(owner, week_start)
         lines = [
             f"・{'買い' if t['side'] == 'buy' else '売り'}: {t['company_name']} ({t['ticker']}) {t['shares']:,} 株 × {t['price']:,.1f} 円"
@@ -367,17 +368,25 @@ async def weekly(now: datetime) -> discord.Embed:
     embed.add_field(name="仮想ポートフォリオ", value="\n".join(pf), inline=False)
 
     st = await battle.standing()
-    wins, losses, draws = st.record()
-    lines = [f"通算 あなた {wins}勝 {losses}敗 {draws}分 ・ AI の性格: {st.mode.label}"]
+    lines = [
+        "通算 あなた "
+        + " ・ ".join(
+            f"vs {portfolio.OWNER_LABELS[ai]} {w}勝 {l}敗 {d}分" for ai in portfolio.AI_OWNERS for w, l, d in [st.record(ai)]
+        )
+        + f" ・ 慎重AIの性格: {st.mode.label}"
+    ]
     if (m := st.current) is not None:
-        lead = {"you": "あなたがリード", "ai": "AI がリード", "draw": "互角"}[m.winner]
-        lines.append(f"今月の途中経過: 🧑 {m.you:+.2%} / 🤖 {m.ai:+.2%} → {lead}")
-    ai_trades = await db.vp_trades("ai", week_start)
-    for t in ai_trades[:MAX_LIST]:
-        action = "買い" if t["side"] == "buy" else "売り"
-        lines.append(f"・🤖 {action}: {t['company_name']} ({t['ticker']}) {t['shares']:,} 株 × {t['price']:,.1f} 円")
-    if not ai_trades:
-        lines.append("今週の AI の売買はありません")
+        lines.append(f"今月の途中経過: {m.returns_text()} → {m.leader_text()}")
+    for ai in portfolio.AI_OWNERS:
+        ai_trades = await db.vp_trades(ai, week_start)
+        icon = portfolio.OWNER_ICONS[ai]
+        for t in ai_trades[:MAX_LIST]:
+            action = "買い" if t["side"] == "buy" else "売り"
+            lines.append(f"・{icon} {action}: {t['company_name']} ({t['ticker']}) {t['shares']:,} 株 × {t['price']:,.1f} 円")
+        if len(ai_trades) > MAX_LIST:
+            lines.append(f"・{icon} ほか {len(ai_trades) - MAX_LIST} 件")
+        if not ai_trades:
+            lines.append(f"今週の{portfolio.OWNER_LABELS[ai]}の売買はありません")
     embed.add_field(name="🏆 AIと勝負", value="\n".join(lines)[:1024], inline=False)
 
     counts: dict[str, int] = {}

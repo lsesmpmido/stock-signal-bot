@@ -383,7 +383,7 @@ async def sell_command(
 
 @app_commands.command(name="portfolio", description="仮想ポートフォリオの保有・損益・NISA 枠の残りを表示します")
 @app_commands.describe(team="表示するチーム（既定: あなた）")
-@app_commands.choices(team=[app_commands.Choice(name="あなた", value="you"), app_commands.Choice(name="AI", value="ai")])
+@app_commands.choices(team=[app_commands.Choice(name=label, value=owner) for owner, label in portfolio.OWNER_LABELS.items()])
 @app_commands.default_permissions(manage_guild=True)
 async def portfolio_command(interaction: discord.Interaction, team: app_commands.Choice[str] | None = None) -> None:
     await interaction.response.defer(thinking=True)
@@ -420,17 +420,17 @@ async def orders_command(interaction: discord.Interaction) -> None:
     )
 
 
-@app_commands.command(name="battle", description="AI との勝負の状況（今月の途中経過・通算成績・AI の性格）を表示します")
+@app_commands.command(name="battle", description="AI との勝負の状況（今月の途中経過・通算成績・慎重 AI の性格）を表示します")
 @app_commands.default_permissions(manage_guild=True)
 async def battle_command(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True)
     try:
         st = await battle.standing()
-        you, ai = await portfolio.summary("you"), await portfolio.summary("ai")
+        summaries = {team: await portfolio.summary(team) for team in battle.TEAMS}
     except Exception as exc:
         await interaction.followup.send(f"⚠️ 勝負の状況の取得でエラーが発生しました: `{exc}`")
         raise
-    await interaction.followup.send(embed=views.battle_embed(st, you, ai))
+    await interaction.followup.send(embed=views.battle_embed(st, summaries))
 
 
 @app_commands.command(name="deposit", description="仮想口座に入金します（あなたと AI に同じ額。いつでも入金できます）")

@@ -37,6 +37,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "vp_deposits_ai": "2400000",
     "vp_fee_rate": "0",  # 売買手数料（売買代金に対する割合。例: 0.0022 = 0.22%）
     "vp_default_amount": "200000",  # 金額を省略したときの購入額（円）
+    "bold_jev_daily_limit": "60",  # 大胆 AI が 1 日に Jev を呼べる回数の上限（料金を抑えるため）
     "vp_nisa_preset": "",  # 勝負を始める前に使った NISA 枠（"年:円"）。その年の NISA 枠の残りから差し引く
 }
 
@@ -106,7 +107,7 @@ CREATE TABLE IF NOT EXISTS company_relations (
     PRIMARY KEY (source, target, relation_type)
 );
 CREATE TABLE IF NOT EXISTS vp_positions (
-    owner        TEXT NOT NULL DEFAULT 'you',  -- 'you' / 'ai'
+    owner        TEXT NOT NULL DEFAULT 'you',  -- 'you' / 'ai'（慎重 AI）/ 'ai_bold'（大胆 AI）
     account      TEXT NOT NULL,  -- 'nisa' / 'tokutei'
     ticker       TEXT NOT NULL,
     company_name TEXT NOT NULL,
@@ -206,13 +207,25 @@ CREATE TABLE IF NOT EXISTS quiz_answers (
     answered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (quiz_id, user_id)
 );
--- AI の大引け後の判断（銘柄ごとの売買・見送りと確信度）。翌取引日の朝にまとめて知らせる
+-- AI の判断（銘柄ごとの売買・見送りと確信度）。AI ごと・日ごとに 1 行で、翌取引日の朝にまとめて知らせる
 CREATE TABLE IF NOT EXISTS ai_decisions (
-    decided_on  DATE PRIMARY KEY,
+    owner       TEXT NOT NULL DEFAULT 'ai',
+    decided_on  DATE NOT NULL,
     data        JSONB NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    reported_at TIMESTAMPTZ
+    reported_at TIMESTAMPTZ,
+    PRIMARY KEY (owner, decided_on)
 );
+-- AI が 1 つだった頃の DB を移行する（既存の判断は慎重 AI の分とし、主キーを AI ごと・日ごとにする）
+ALTER TABLE ai_decisions ADD COLUMN IF NOT EXISTS owner TEXT NOT NULL DEFAULT 'ai';
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+        WHERE i.indrelid = 'ai_decisions'::regclass AND i.indisprimary) = 1 THEN
+        ALTER TABLE ai_decisions DROP CONSTRAINT ai_decisions_pkey;
+        ALTER TABLE ai_decisions ADD PRIMARY KEY (owner, decided_on);
+    END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS notification_log (
     id      BIGSERIAL PRIMARY KEY,
     kind    TEXT NOT NULL,  -- proposal / signal / delist / report
@@ -298,7 +311,37 @@ async def init() -> None:
                 "INSERT INTO user_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING",
                 (key, value),
             )
+        await _start_bold(conn)
     log.info("DB 初期化完了")
+
+
+async def _start_bold(conn) -> None:
+    """大胆 AI の口座がまだなければ、慎重 AI の今の状態（現金・入金額の合計・保有・売買履歴・総資産の記録）を複製して作る。
+
+    売買履歴も複製するのは、今年使った NISA 枠と、特定口座の損益の相殺（税金）を慎重 AI とそろえるため。
+    """
+    async with conn.transaction():
+        cur = await conn.execute("SELECT 1 FROM user_settings WHERE key = %s", (CASH_KEYS["ai_bold"],))
+        if await cur.fetchone() is not None:
+            return
+        for src, dst in ((CASH_KEYS["ai"], CASH_KEYS["ai_bold"]), (DEPOSIT_KEYS["ai"], DEPOSIT_KEYS["ai_bold"])):
+            await conn.execute(
+                "INSERT INTO user_settings (key, value) SELECT %s, value FROM user_settings WHERE key = %s", (dst, src)
+            )
+        await conn.execute(
+            "INSERT INTO vp_positions (owner, account, ticker, company_name, shares, cost, opened_at) "
+            "SELECT 'ai_bold', account, ticker, company_name, shares, cost, opened_at FROM vp_positions WHERE owner = 'ai'"
+        )
+        await conn.execute(
+            "INSERT INTO vp_trades (owner, account, ticker, company_name, side, shares, price, amount, fee, realized, tax, "
+            "reason, confidence, traded_at) SELECT 'ai_bold', account, ticker, company_name, side, shares, price, amount, "
+            "fee, realized, tax, reason, confidence, traded_at FROM vp_trades WHERE owner = 'ai'"
+        )
+        await conn.execute(
+            "INSERT INTO vp_snapshots (owner, date, total_value, deposits) "
+            "SELECT 'ai_bold', date, total_value, deposits FROM vp_snapshots WHERE owner = 'ai'"
+        )
+    log.info("大胆 AI の口座を、慎重 AI の今の状態を複製して作りました")
 
 
 async def close() -> None:
@@ -649,8 +692,8 @@ async def prune_prices(before: date) -> int:
 
 # ---------------------------------------------------------------- 仮想売買（vp_positions / vp_trades / vp_orders / vp_snapshots）
 
-CASH_KEYS = {"you": "vp_cash", "ai": "vp_cash_ai"}
-DEPOSIT_KEYS = {"you": "vp_deposits_you", "ai": "vp_deposits_ai"}
+CASH_KEYS = {"you": "vp_cash", "ai": "vp_cash_ai", "ai_bold": "vp_cash_ai_bold"}
+DEPOSIT_KEYS = {"you": "vp_deposits_you", "ai": "vp_deposits_ai", "ai_bold": "vp_deposits_ai_bold"}
 
 
 async def vp_positions(owner: str, ticker: str | None = None) -> list[dict[str, Any]]:
@@ -809,9 +852,9 @@ async def vp_reset(
     started_at: datetime,
     nisa_preset: str,
 ) -> None:
-    """自分と AI の仮想口座を、同じ初期条件（現金・保有）で作り直す。売買履歴・注文・勝負の記録・AI の判断は消す。
+    """3 チーム（自分と 2 つの AI）の仮想口座を、同じ初期条件（現金・保有）で作り直す。売買履歴・注文・勝負の記録・AI の判断は消す。
 
-    positions: 両チームに持たせる保有（account, ticker, company_name, shares, cost, opened_at）。
+    positions: 全チームに持たせる保有（account, ticker, company_name, shares, cost, opened_at）。
     """
     async with _pool_or_raise().connection() as conn:
         async with conn.transaction():
@@ -968,30 +1011,41 @@ async def quiz_answers(quiz_id: int) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------- ai_decisions
 
 
-async def ai_save_decisions(day: date, data: dict[str, Any]) -> None:
+async def ai_save_decisions(owner: str, day: date, data: dict[str, Any]) -> None:
     """その日の AI の判断を保存する。同じ日に判断し直したら上書きし、まだ知らせていない扱いに戻す。"""
     async with _pool_or_raise().connection() as conn:
         await conn.execute(
-            "INSERT INTO ai_decisions (decided_on, data) VALUES (%s, %s) "
-            "ON CONFLICT (decided_on) DO UPDATE SET data = EXCLUDED.data, created_at = now(), reported_at = NULL",
-            (day, Jsonb(data)),
+            "INSERT INTO ai_decisions (owner, decided_on, data) VALUES (%s, %s, %s) "
+            "ON CONFLICT (owner, decided_on) DO UPDATE SET data = EXCLUDED.data, created_at = now(), reported_at = NULL",
+            (owner, day, Jsonb(data)),
         )
 
 
+async def ai_get_decisions(owner: str, day: date) -> dict[str, Any] | None:
+    """その日の AI の判断（大胆 AI は 1 日に何度も判断するので、前の回の記録に書き足すのに使う）。"""
+    async with _pool_or_raise().connection() as conn:
+        row = await (
+            await conn.execute("SELECT data FROM ai_decisions WHERE owner = %s AND decided_on = %s", (owner, day))
+        ).fetchone()
+    return row["data"] if row else None
+
+
 async def ai_unreported_decisions(before: date) -> list[dict[str, Any]]:
-    """before より前の日の判断のうち、まだ知らせていないもの（古い順）。"""
+    """before より前の日の判断のうち、まだ知らせていないもの（日付の古い順、同じ日は慎重 AI が先）。"""
     async with _pool_or_raise().connection() as conn:
         return await (
             await conn.execute(
-                "SELECT * FROM ai_decisions WHERE decided_on < %s AND reported_at IS NULL ORDER BY decided_on",
+                "SELECT * FROM ai_decisions WHERE decided_on < %s AND reported_at IS NULL ORDER BY decided_on, owner",
                 (before,),
             )
         ).fetchall()
 
 
-async def ai_mark_reported(day: date) -> None:
+async def ai_mark_reported(owner: str, day: date) -> None:
     async with _pool_or_raise().connection() as conn:
-        await conn.execute("UPDATE ai_decisions SET reported_at = now() WHERE decided_on = %s", (day,))
+        await conn.execute(
+            "UPDATE ai_decisions SET reported_at = now() WHERE owner = %s AND decided_on = %s", (owner, day)
+        )
 
 
 # ---------------------------------------------------------------- notification_log

@@ -105,6 +105,40 @@ class JevJudge:
         )
         return result.nouls["buy"].noul
 
+    async def should_buy_bold(self, state: dict) -> tuple[float, float]:
+        """大胆 AI 用: 今すぐ買うべきかを、短期（数日）と長期（数か月以上）の 2 つの確信度（0〜1）で返す。
+
+        短期向きなら特定口座で、長期向きなら NISA で買う。1 回の呼び出しで両方を聞く（呼び出し回数を抑えるため）。
+        """
+        result = await self._client.system_one(
+            state=state,
+            questions={
+                "short": Noul(
+                    instructions=(
+                        "あなたは日本株を短期（数日）で売買する積極的な個人投資家です。"
+                        "今日の急騰・出来高の急増・新しい材料をきっかけに、この銘柄を今すぐ買えば、数日のうちにさらに上がりますか？"
+                        "勢いが続く材料か、一時的な反応で終わるかを、材料の強さと値動きの状態から判断してください。"
+                    ),
+                    criteria={
+                        "true": "材料と勢いから、数日のうちにさらに上がる可能性が高い",
+                        "false": "すでに織り込まれた・材料が弱い・反落しそうなどの理由で、短期では上がりにくい",
+                    },
+                ),
+                "long": Noul(
+                    instructions=(
+                        "あなたは日本株を数か月以上持つ個人投資家です。"
+                        "この銘柄は、今買って数か月以上持ち続ける価値がありますか？ 一時的な値動きではなく、"
+                        "業績や事業の変化につながる材料かどうかで判断してください。"
+                    ),
+                    criteria={
+                        "true": "業績・事業の変化につながり、数か月以上持つ価値がある",
+                        "false": "一時的な材料・割高などの理由で、長く持つ価値は低い",
+                    },
+                ),
+            },
+        )
+        return result.nouls["short"].noul, result.nouls["long"].noul
+
     async def should_sell(self, state: dict) -> float:
         """AI トレーダー用: 保有中のこの銘柄を翌取引日の寄り付きで売るべきかの確信度（0〜1）。"""
         result = await self._client.system_one(

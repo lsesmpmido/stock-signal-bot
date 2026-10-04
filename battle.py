@@ -1,8 +1,10 @@
-"""AI との勝負。毎日記録している両チームの総資産から、月ごとの勝敗と AI のモードを決める。
+"""AI との勝負。毎日記録している 3 チーム（あなた・慎重 AI・大胆 AI）の総資産から、月ごとの勝敗・順位と慎重 AI のモードを決める。
 
 - 月ごとに、総資産の増減率（税金・手数料込み、その月の入金分を除く）を比べる。差が 0.05% 以内なら引き分け
-- AI のモード: 直近の連敗が 3 か月以上なら勝負師、1〜2 か月なら弟子、通算で AI が勝ち越しなら堅実、それ以外は通常
-- 初期条件（現金・すでに持っている銘柄）を指定して、両チーム同じ状態から勝負をやり直せる
+- 勝敗は「あなた対慎重 AI」「あなた対大胆 AI」をそれぞれ数え、月ごとの順位も出す
+- 慎重 AI のモード: あなたに対する直近の連敗が 3 か月以上なら勝負師、1〜2 か月なら弟子、通算で勝ち越しなら堅実、それ以外は通常
+  （大胆 AI の性格は固定）
+- 初期条件（現金・すでに持っている銘柄）を指定して、3 チーム同じ状態から勝負をやり直せる
 """
 
 from __future__ import annotations
@@ -26,25 +28,46 @@ ACCOUNT_WORDS = {"nisa": "nisa", "ニーサ": "nisa", "特定": "tokutei", "特�
 DATE_PATTERN = re.compile(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})")
 
 
+TEAMS = ("you", "ai", "ai_bold")
+
+
 @dataclass(frozen=True)
 class MonthResult:
     month: str  # "2026-10"
-    you: float
-    ai: float
+    returns: dict[str, float]  # チームごとの増減率（その月に記録のあるチームだけ）
     finished: bool
 
-    @property
-    def winner(self) -> str:
-        diff = self.you - self.ai
+    def versus(self, ai: str) -> str | None:
+        """あなたと ai の勝敗（"you" / ai / "draw"）。どちらかの記録がなければ None。"""
+        if "you" not in self.returns or ai not in self.returns:
+            return None
+        diff = self.returns["you"] - self.returns[ai]
         if abs(diff) <= DRAW_MARGIN:
             return "draw"
-        return "you" if diff > 0 else "ai"
+        return "you" if diff > 0 else ai
+
+    def ranking(self) -> list[str]:
+        """増減率の高い順のチーム。"""
+        return sorted(self.returns, key=lambda t: self.returns[t], reverse=True)
+
+    def returns_text(self) -> str:
+        """各チームの増減率（例: 🧑 +1.20% / 🤖 +0.50% / ⚡ +2.10%）。"""
+        return " / ".join(f"{portfolio.OWNER_ICONS[t]} {self.returns[t]:+.2%}" for t in TEAMS if t in self.returns)
+
+    def leader_text(self) -> str:
+        """トップのチーム（差が引き分けの幅以内なら並んでいるとする）。終わった月は「1 位」、途中の月は「リード」。"""
+        ranking = self.ranking()
+        top = [t for t in ranking if self.returns[ranking[0]] - self.returns[t] <= DRAW_MARGIN]
+        names = "・".join(portfolio.OWNER_LABELS[t] for t in top)
+        if len(top) > 1:
+            return f"{names}が並んで{' 1 位' if self.finished else 'トップ'}"
+        return f"{names}が{' 1 位' if self.finished else 'リード'}"
 
 
 @dataclass
 class Standing:
     months: list[MonthResult]
-    mode: ai_trader.Mode
+    mode: ai_trader.Mode  # 慎重 AI のモード
 
     @property
     def finished(self) -> list[MonthResult]:
@@ -54,10 +77,10 @@ class Standing:
     def current(self) -> MonthResult | None:
         return next((m for m in self.months if not m.finished), None)
 
-    def record(self) -> tuple[int, int, int]:
-        """自分から見た通算成績（勝ち・負け・引き分け）。"""
-        results = [m.winner for m in self.finished]
-        return results.count("you"), results.count("ai"), results.count("draw")
+    def record(self, ai: str = "ai") -> tuple[int, int, int]:
+        """あなたから見た、ai との通算成績（勝ち・負け・引き分け）。"""
+        results = [r for m in self.finished if (r := m.versus(ai)) is not None]
+        return results.count("you"), results.count(ai), results.count("draw")
 
 
 def _monthly_returns(snapshots: list[dict]) -> dict[str, float]:
@@ -79,26 +102,29 @@ def _monthly_returns(snapshots: list[dict]) -> dict[str, float]:
 
 
 def _mode(finished: list[MonthResult]) -> ai_trader.Mode:
+    """慎重 AI のモード（あなたとの勝敗で決める）。"""
+    results = [r for m in finished if (r := m.versus("ai")) is not None]
     streak = 0
-    for m in reversed(finished):
-        if m.winner != "you":
+    for r in reversed(results):
+        if r != "you":
             break
         streak += 1
     if streak >= 3:
         return ai_trader.MODES["gambler"]
     if streak >= 1:
         return ai_trader.MODES["apprentice"]
-    results = [m.winner for m in finished]
     if results.count("ai") > results.count("you"):
         return ai_trader.MODES["steady"]
     return ai_trader.MODES["normal"]
 
 
 async def standing() -> Standing:
-    you = _monthly_returns(await db.vp_snapshots("you"))
-    ai = _monthly_returns(await db.vp_snapshots("ai"))
+    returns = {team: _monthly_returns(await db.vp_snapshots(team)) for team in TEAMS}
     this_month = market.now_jst().strftime("%Y-%m")
-    months = [MonthResult(m, you[m], ai[m], m < this_month) for m in sorted(set(you) & set(ai))]
+    months = [
+        MonthResult(m, {team: r[m] for team, r in returns.items() if m in r}, m < this_month)
+        for m in sorted(set().union(*returns.values()))
+    ]
     return Standing(months, _mode([m for m in months if m.finished]))
 
 
@@ -240,7 +266,7 @@ def long_held(plan: StartPlan, today: date) -> list[StartHolding]:
 
 
 async def apply_start(plan: StartPlan, now: datetime) -> None:
-    """両チームを同じ初期条件にして、勝負をやり直す。これまでの売買履歴・注文・勝負の記録は消える。"""
+    """3 チームを同じ初期条件にして、勝負をやり直す。これまでの売買履歴・注文・勝負の記録は消える。"""
     positions = [
         {
             "account": h.account,

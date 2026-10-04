@@ -141,7 +141,7 @@ def _block_reasons(c: Candidate, mode: Mode) -> list[str]:
     return reasons
 
 
-def _facts(f: dict) -> str:
+def facts(f: dict) -> str:
     """判断に使った値動きの状態を 1 行にまとめる（Jev は理由の文章を返さないので、材料を見せる）。"""
     parts = []
     if f.get("rsi") is not None:
@@ -157,10 +157,11 @@ def _facts(f: dict) -> str:
     return " ・ ".join(parts)
 
 
-async def _collect_candidates(now: datetime) -> dict[str, Candidate]:
+async def collect_candidates(now: datetime, owner: str = OWNER) -> dict[str, Candidate]:
+    """候補の銘柄（提案が新しいもの・自分が気にしているものの順）。owner がすでに持っている・注文中の銘柄は除く。"""
     today = now.date()
-    held = {p["ticker"] for p in await db.vp_positions(OWNER)}
-    ordered = {o["ticker"] for o in await db.vp_orders("open", OWNER)}
+    held = {p["ticker"] for p in await db.vp_positions(owner)}
+    ordered = {o["ticker"] for o in await db.vp_orders("open", owner)}
     found: dict[str, Candidate] = {}
 
     def add(ticker, name, source, news=None):
@@ -212,7 +213,7 @@ def _similarity(f: dict, style: dict) -> float:
     return max(0.0, 1 - distance / 2)
 
 
-def _news_state(news: dict | None) -> dict | None:
+def news_state(news: dict | None) -> dict | None:
     if not news:
         return None
     return {
@@ -231,7 +232,7 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
     # 前日の売り注文がまだ約定していない銘柄は、見直しの対象から外す（売り注文の重複を防ぐ）
     pending_sells = {o["ticker"] for o in await db.vp_orders("open", OWNER) if o["side"] == "sell"}
     positions = [p for p in await db.vp_positions(OWNER) if p["ticker"] not in pending_sells]
-    candidates = await _collect_candidates(now)
+    candidates = await collect_candidates(now)
     tickers = sorted({p["ticker"] for p in positions} | set(candidates))
     # 自分が過去に買った銘柄の日足は、弟子モードで自分の買い方を調べるときだけ使う
     your_buys = [t["ticker"] for t in await db.vp_trades("you") if t["side"] == "buy"] if mode.follow_you else []
@@ -308,7 +309,7 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
         state = {
             "company": c.name,
             "sources": [SOURCE_LABELS[s] for s in c.sources],
-            "news": _news_state(c.news),
+            "news": news_state(c.news),
             **c.features,
         }
         try:
@@ -364,6 +365,7 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
 
     decisions.log = _decision_log(decisions, holdings, candidates)
     await db.ai_save_decisions(
+        OWNER,
         today,
         {
             "mode": mode.label,
@@ -390,7 +392,7 @@ def _decision_log(decisions: Decisions, holdings: dict[str, HoldingView], candid
     sold = {h.ticker: (reason, confidence) for h, reason, confidence in decisions.sells}
     for h in holdings.values():
         position = f"含み損益 {h.return_rate:+.1%} ・ 保有 {h.held_days} 営業日"
-        entry = {"ticker": h.ticker, "name": h.name, "facts": f"{position} ・ {_facts(h.features)}"}
+        entry = {"ticker": h.ticker, "name": h.name, "facts": f"{position} ・ {facts(h.features)}"}
         if h.ticker in sold:
             reason, confidence = sold[h.ticker]
             entries.append({**entry, "action": "sell", "confidence": confidence, "note": reason})
@@ -404,7 +406,7 @@ def _decision_log(decisions: Decisions, holdings: dict[str, HoldingView], candid
             "sources": [SOURCE_LABELS[s] for s in c.sources],
             "confidence": c.confidence,
             "bonus": c.bonus,
-            "facts": _facts(c.features),
+            "facts": facts(c.features),
         }
         if c.ticker in bought:
             entries.append({**entry, "action": "buy", "note": None})

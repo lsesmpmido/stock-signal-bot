@@ -409,7 +409,7 @@ def sell_embed(r: portfolio.SellResult) -> discord.Embed:
 
 def portfolio_embed(s: portfolio.Summary) -> discord.Embed:
     color = discord.Color.green() if s.total_return >= 0 else discord.Color.red()
-    who = "🤖 AI の" if s.owner == "ai" else ""
+    who = "" if s.owner == "you" else f"{portfolio.OWNER_ICONS[s.owner]} {portfolio.OWNER_LABELS[s.owner]}の"
     embed = discord.Embed(title=f"📊 {who}仮想ポートフォリオ（新NISA＋特定口座）", color=color)
     lines = [f"総資産 **{_yen(s.total_value)}**（入金額の合計 {_yen(s.deposits)} から {s.total_return:+.2%}）"]
     if s.topix_change is not None:
@@ -432,7 +432,7 @@ def portfolio_embed(s: portfolio.Summary) -> discord.Embed:
             text.append(f"ほか {len(rows) - 15} 銘柄")
         embed.add_field(name=label, value="\n".join(text)[:1024], inline=False)
     if not s.holdings:
-        empty = "まだ保有していません。" + ("" if s.owner == "ai" else "`/buy` や「💰 仮想で買う」ボタンで買えます。")
+        empty = "まだ保有していません。" + ("`/buy` や「💰 仮想で買う」ボタンで買えます。" if s.owner == "you" else "")
         embed.add_field(name="保有", value=empty, inline=False)
     embed.set_footer(
         text=f"今年の税金 {_yen(s.year_tax)} ・ 手数料 {_yen(s.year_fee)} ・ {s.started_at.astimezone(JST):%Y/%m/%d} 開始 ・ 株価は約 20 分遅れ"
@@ -462,10 +462,10 @@ def fills_embed(executed: list[orders.Executed], owner: str) -> discord.Embed:
 
 
 def ai_fills_embed(
-    executed: list[orders.Executed], mode: ai_trader.Mode, now, title: str | None = None
+    executed: list[orders.Executed], mode: ai_trader.Mode | None, now, title: str | None = None
 ) -> discord.Embed:
-    """AI の今日の売買（寄り付きで約定したもの、または取引時間中の損切り）をまとめる。"""
-    title = title or f"🤖 AIの売買（{now:%m/%d} 寄り付き）{mode.label}"
+    """AI の売買（寄り付きで約定したもの、取引時間中の損切り、大胆 AI の場中の売買）をまとめる。"""
+    title = title or f"🤖 慎重AIの売買（{now:%m/%d} 寄り付き）{mode.label if mode else ''}"
     embed = discord.Embed(title=title, color=discord.Color.dark_teal())
     lines = []
     for e in executed:
@@ -478,8 +478,10 @@ def ai_fills_embed(
         elif isinstance(e.result, portfolio.BuyResult):
             r = e.result
             accounts = "・".join(portfolio.ACCOUNT_LABELS[f.account] for f in r.fills)
-            source = ai_trader.SOURCE_LABELS.get(o["source"] or "", o["source"] or "")
-            detail = " ・ ".join(x for x in (conf, f"候補: {source}" if source else None) if x)
+            source = ai_trader.SOURCE_LABELS.get(o.get("source") or "", o.get("source") or "")
+            # 大胆 AI の買いは、短期か長期か（口座）ときっかけを理由に入れている
+            reason = o["reason"] if o.get("style") else None
+            detail = " ・ ".join(x for x in (reason, conf, f"候補: {source}" if source else None) if x)
             lines.append(f"🟢 買い: {r.company_name} ({r.ticker}) {r.shares:,} 株 × {r.price:,.1f} 円（{accounts}）\n　{detail}")
         else:
             r = e.result
@@ -507,8 +509,12 @@ def _field_lines(lines: list[str], rest: int) -> str:
 
 
 def ai_decisions_embed(record: dict) -> discord.Embed:
-    """前の取引日の大引け後に AI が判断した内容（売買・持ち続け・見送りと、それぞれの確信度・理由）。"""
+    """前の取引日に AI が判断した内容（売買・持ち続け・見送りと、それぞれの確信度・理由）。
+
+    慎重 AI は大引け後の 1 回の判断、大胆 AI は場中の各回と大引け後の判断を 1 日分まとめたもの。
+    """
     data, day = record["data"], record["decided_on"]
+    owner = record.get("owner", "ai")
     entries = data["entries"]
     by_action: dict[str, list[dict]] = {}
     for e in entries:
@@ -517,14 +523,21 @@ def ai_decisions_embed(record: dict) -> discord.Embed:
     holds, passes = by_action.get("hold", []), by_action.get("pass", [])
     blocked, skipped = by_action.get("blocked", []), by_action.get("skipped", [])
 
-    embed = discord.Embed(title=f"🧠 AIの判断（{day:%m/%d} 大引け後）{data['mode']}", color=discord.Color.dark_teal())
+    if owner == "ai":
+        title = f"🧠 慎重AIの判断（{day:%m/%d} 大引け後）{data['mode']}"
+    else:
+        title = f"🧠 {portfolio.OWNER_ICONS[owner]} {portfolio.OWNER_LABELS[owner]}の判断（{day:%m/%d} 場中〜大引け後）"
+    embed = discord.Embed(title=title, color=discord.Color.dark_teal() if owner == "ai" else discord.Color.dark_gold())
     headline = (
         f"売り {len(sells)} ・ 買い {len(buys)}" if sells or buys else "**売買はしませんでした**（すべて見送り・持ち続け）"
+    )
+    criteria = data.get("criteria") or (
+        f"買いの確信度 {data['buy_threshold']:.0%} 以上 ・ 売りの確信度 {data['sell_threshold']:.0%} 以上"
     )
     embed.description = (
         f"{headline}\n"
         f"持ち続け {len(holds)} ・ 見送り {len(passes)} ・ 安全ルールで除外 {len(blocked)} ・ Jev の判定 {data['judged']} 件\n"
-        f"基準: 買いの確信度 {data['buy_threshold']:.0%} 以上 ・ 売りの確信度 {data['sell_threshold']:.0%} 以上"
+        f"基準: {criteria}"
     )
     if not entries:
         embed.description += "\n\n保有も候補もありませんでした（候補は提案銘柄・監視銘柄・あなたが買った銘柄）。"
@@ -543,7 +556,9 @@ def ai_decisions_embed(record: dict) -> discord.Embed:
         embed.add_field(name="🔴 売り", value=_field_lines(lines, 0), inline=False)
     if buys:
         lines = [
-            f"**{e['name']}** ({e['ticker']}) — 買いの確信度 {score(e)} ・ 候補: {'・'.join(e['sources'])}\n　{e['facts']}"
+            f"**{e['name']}** ({e['ticker']}) — "
+            + (f"{e['note']} ・ " if e.get("note") else "")
+            + f"買いの確信度 {score(e)} ・ 候補: {'・'.join(e['sources'])}\n　{e['facts']}"
             for e in buys
         ]
         embed.add_field(name="🟢 買い", value=_field_lines(lines, 0), inline=False)
@@ -814,28 +829,26 @@ def related_tree_embed(
 
 # ---------------------------------------------------------------- AI との勝負
 
-def battle_embed(st: battle.Standing, you: portfolio.Summary, ai: portfolio.Summary) -> discord.Embed:
-    wins, losses, draws = st.record()
-    embed = discord.Embed(title="🏆 AI vs あなた", color=discord.Color.orange())
-    lines = [f"通算成績（月ごと）: あなた **{wins}勝 {losses}敗 {draws}分**", f"AI の今の性格: {st.mode.label}"]
+def battle_embed(st: battle.Standing, summaries: dict[str, portfolio.Summary]) -> discord.Embed:
+    embed = discord.Embed(title="🏆 AIと勝負（あなた vs 慎重AI vs 大胆AI）", color=discord.Color.orange())
+    lines = []
+    for ai in portfolio.AI_OWNERS:
+        wins, losses, draws = st.record(ai)
+        lines.append(f"通算（月ごと）vs {portfolio.OWNER_ICONS[ai]} {portfolio.OWNER_LABELS[ai]}: あなた **{wins}勝 {losses}敗 {draws}分**")
+    lines.append(f"慎重AIの今の性格: {st.mode.label} ・ 大胆AIの性格: 固定")
     if (m := st.current) is not None:
-        lead = {"you": "あなたがリード", "ai": "AI がリード", "draw": "互角"}[m.winner]
-        lines.append(f"\n**今月（{m.month}）の途中経過**: 🧑 {m.you:+.2%} / 🤖 {m.ai:+.2%} → {lead}")
+        lines.append(f"\n**今月（{m.month}）の途中経過**: {m.returns_text()} → {m.leader_text()}")
     else:
         lines.append("\n今月の記録はまだありません（大引け後に毎日記録します）。")
     embed.description = "\n".join(lines)
-    for label, s in (("🧑 あなた", you), ("🤖 AI", ai)):
+    for owner, s in summaries.items():
         embed.add_field(
-            name=label,
+            name=f"{portfolio.OWNER_ICONS[owner]} {portfolio.OWNER_LABELS[owner]}",
             value=f"総資産 {_yen(s.total_value)}（通算 {s.total_return:+.2%}）\n保有 {len(s.holdings)} 銘柄 ・ 現金 {_yen(s.cash)}",
         )
     if st.finished:
-        history = [
-            f"{m.month}: 🧑 {m.you:+.2%} / 🤖 {m.ai:+.2%} → "
-            + {"you": "あなたの勝ち", "ai": "AI の勝ち", "draw": "引き分け"}[m.winner]
-            for m in st.finished[-6:]
-        ]
-        embed.add_field(name="これまでの月", value="\n".join(history), inline=False)
+        history = [f"{m.month}: {m.returns_text()} → {m.leader_text()}" for m in st.finished[-6:]]
+        embed.add_field(name="これまでの月", value="\n".join(history)[:1024], inline=False)
     embed.set_footer(text="総資産の増減率（税金・手数料込み、入金分を除く）で比べる。差が 0.05% 以内は引き分け")
     return embed
 

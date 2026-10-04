@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 import access
 import ai_trader
 import battle
+import bold_trader
 import charts
 import commands
 import db
@@ -95,6 +96,13 @@ def signal_slots(freq: str, day: datetime) -> list[datetime]:
     if freq == "close":
         return [datetime.combine(d, CLOSE_TIME, JST)]
     return []
+
+
+def bold_slots(day: datetime) -> list[datetime]:
+    """大胆 AI が場中に判断する時刻（取引日の 10:00・11:00・13:00・14:00・15:00）。"""
+    if not market.is_trading_day(day.date()):
+        return []
+    return [datetime.combine(day.date(), t, JST) for t in bold_trader.SLOT_TIMES]
 
 
 def price_sync_slots(day: datetime) -> list[datetime]:
@@ -184,6 +192,7 @@ class StockBot(ext_commands.Bot):
         self._report_lock = asyncio.Lock()
         self._prices_synced_on: date | None = None  # その日の確定した日足を保存し終えた日
         self._fill_lock = asyncio.Lock()
+        self._bold_lock = asyncio.Lock()
         self._alert_lock = asyncio.Lock()
         self._hot_lock = asyncio.Lock()
         self._fiscal_lock = asyncio.Lock()
@@ -276,6 +285,11 @@ class StockBot(ext_commands.Bot):
         if slot and slot != settings.get("_last_fill_slot") and not self._fill_lock.locked():
             await db.set_setting("_last_fill_slot", slot)
             self._spawn(self._guarded(self._fill_lock, self.run_fill_job))
+
+        slot = due_slot(bold_slots(now), now)
+        if slot and slot != settings.get("_last_bold_slot") and not self._bold_lock.locked():
+            await db.set_setting("_last_bold_slot", slot)
+            self._spawn(self._guarded(self._bold_lock, self.run_bold_slot))
 
         slot = due_slot(alert_slots(now), now)
         if slot and slot != settings.get("_last_alert_slot") and not self._alert_lock.locked():
@@ -626,17 +640,21 @@ class StockBot(ext_commands.Bot):
             await self.run_ai_trader()
         except Exception:
             log.exception("AI トレーダーの判断でエラーが発生しました")
+        try:
+            await bold_trader.after_close(self.jev, market.now_jst())
+        except Exception:
+            log.exception("大胆 AI の大引け後の判断でエラーが発生しました")
 
     async def run_reset(self, plan: battle.StartPlan, now: datetime) -> bool:
         """勝負をやり直す。AI の判断（日足保存の後）や注文の約定の途中なら、やり直さずに False を返す。
 
         途中でやり直すと、やり直す前の保有・現金にもとづく注文や判断が、新しい口座に入ってしまうため。
-        やり直しの間は両方のロックを持ち、スケジューラが同じ時刻にこれらのジョブを始めないようにする
+        やり直しの間はこれらのロック（大胆 AI の場中の判断も含む）を持ち、スケジューラが同じ時刻にこれらのジョブを始めないようにする
         （ロック中はその時刻を実行済みにせず、次の tick で改めて始める）。
         """
-        if self._price_sync_lock.locked() or self._fill_lock.locked():
+        if self._price_sync_lock.locked() or self._fill_lock.locked() or self._bold_lock.locked():
             return False
-        async with self._price_sync_lock, self._fill_lock:
+        async with self._price_sync_lock, self._fill_lock, self._bold_lock:
             await battle.apply_start(plan, now)
         return True
 
@@ -810,6 +828,7 @@ class StockBot(ext_commands.Bot):
         executed = await orders.fill_open_orders(now)
         mine = [e for e in executed if e.order["owner"] == "you"]
         ai = [e for e in executed if e.order["owner"] == "ai"]
+        bold = [e for e in executed if e.order["owner"] == bold_trader.OWNER]  # 大引け後の判断で出した売り注文
         # 約定はもう済んでいるので、ここから先の失敗で約定の通知を落とさないよう、通知ごとに失敗を受け止める
         # 前日の判断は、寄り付き（始値での約定）の後に知らせる。判断の直後に知らせると、AI の注文を見て同じ値段で買えてしまう
         try:
@@ -822,7 +841,7 @@ class StockBot(ext_commands.Bot):
         except Exception:
             log.exception("AI の取引時間中の損切りでエラーが発生しました")
             stops = []
-        if not (mine or ai or decisions or stops):
+        if not (mine or ai or bold or decisions or stops):
             return
         channel = await self._report_channel()
         if mine:
@@ -837,14 +856,17 @@ class StockBot(ext_commands.Bot):
             log.exception("AI の性格の取得に失敗しました")
             mode = ai_trader.MODES["normal"]
         # (埋め込み, 送れたら通知済みにする判断) の組。約定した売買と判断は、Discord の上限に収まる範囲で 1 通にまとめる
-        items = [(views.ai_fills_embed(ai, mode, now), None)] if ai else []
+        items = [(views.ai_fills_embed(ai, mode, now), "ai")] if ai else []
+        if bold:
+            title = f"⚡ 大胆AIの売買（{now:%m/%d} 寄り付き）"
+            items.append((views.ai_fills_embed(bold, None, now, title=title), bold_trader.OWNER))
         for d in decisions:
             try:
                 items.append((views.ai_decisions_embed(d), d))
             except Exception:
                 # 表示できない記録で毎回失敗し続けないよう、通知済みにして飛ばす（記録は ai_decisions に残る）
-                log.exception("AI の判断（%s）を表示できませんでした", d["decided_on"])
-                await db.ai_mark_reported(d["decided_on"])
+                log.exception("AI の判断（%s %s）を表示できませんでした", d["owner"], d["decided_on"])
+                await db.ai_mark_reported(d["owner"], d["decided_on"])
         for batch in pack_embeds(items):
             try:
                 await channel.send(embeds=[embed for embed, _ in batch])
@@ -852,17 +874,28 @@ class StockBot(ext_commands.Bot):
                 log.exception("AI の売買・判断の通知に失敗しました")
                 continue
             for embed, d in batch:
-                if d is None:
-                    for e in ai:
+                if isinstance(d, str):  # 約定した売買（d は持ち主）
+                    for e in ai if d == "ai" else bold:
                         await db.log_notification("ai_trade", e.order["ticker"], e.order["side"])
                 else:
-                    await db.ai_mark_reported(d["decided_on"])
-                    await db.log_notification("ai_decisions", detail=d["decided_on"].isoformat())
+                    await db.ai_mark_reported(d["owner"], d["decided_on"])
+                    await db.log_notification("ai_decisions", detail=f"{d['owner']} {d['decided_on'].isoformat()}")
         if stops:
             title = f"🤖 AIが取引時間中に損切りしました（{now:%m/%d %H:%M}）"
             await channel.send(embed=views.ai_fills_embed(stops, mode, now, title=title))
             for e in stops:
                 await db.log_notification("ai_trade", e.order["ticker"], "stop_loss")
+
+    async def run_bold_slot(self) -> None:
+        """大胆 AI の場中の判断。売買があった回だけ、まとめて 1 通で知らせる。"""
+        now = market.now_jst()
+        executed = await bold_trader.run_slot(self.jev, now)
+        if not executed:
+            return
+        title = f"⚡ 大胆AIの売買（{now:%m/%d %H:%M}・場中）"
+        await (await self._report_channel()).send(embed=views.ai_fills_embed(executed, None, now, title=title))
+        for e in executed:
+            await db.log_notification("ai_trade", e.order["ticker"], e.order["side"])
 
     # ------------------------------------------------------------ モジュール3: 売買シグナル
 

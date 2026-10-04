@@ -1,4 +1,4 @@
-"""仮想売買（新NISA 成長投資枠＋特定口座）。自分（you）と AI（ai）が同じルールの別々の口座で運用する。
+"""仮想売買（新NISA 成長投資枠＋特定口座）。自分（you）と 2 つの AI（ai: 慎重 AI、ai_bold: 大胆 AI）が同じルールの別々の口座で運用する。
 
 - 軍資金 240 万円。現金は 2 つの口座で共通。/deposit でいつでも追加入金でき、AI にも同じ額が入る
 - 買うときは NISA を優先し、その年の NISA 枠（購入額の合計 240 万円）を超える分は特定口座で買う
@@ -30,7 +30,9 @@ log = logging.getLogger(__name__)
 NISA_ANNUAL_LIMIT = 2_400_000
 TAX_RATE = 0.20315
 ACCOUNT_LABELS = {"nisa": "NISA", "tokutei": "特定口座"}
-OWNER_LABELS = {"you": "あなた", "ai": "AI"}
+OWNER_LABELS = {"you": "あなた", "ai": "慎重AI", "ai_bold": "大胆AI"}
+OWNER_ICONS = {"you": "🧑", "ai": "🤖", "ai_bold": "⚡"}
+AI_OWNERS = ("ai", "ai_bold")
 MARKET_OPEN = time(9, 0)
 MARKET_CLOSE = time(15, 30)
 LUNCH_START = time(11, 30)  # 前場の終わり
@@ -164,7 +166,7 @@ def nisa_preset(settings: dict[str, str], year: int) -> float:
     return float(amount) if preset_year == str(year) and amount else 0.0
 
 
-async def _nisa_left(owner: str, when: datetime) -> float:
+async def nisa_room(owner: str, when: datetime) -> float:
     totals = await db.vp_year_totals(owner, _year_start(when))
     used = totals["nisa_bought"] + nisa_preset(await db.get_all_settings(), when.year)
     return max(0.0, NISA_ANNUAL_LIMIT - used)
@@ -197,8 +199,13 @@ async def buy(
     reason: str | None = None,
     confidence: float | None = None,
     traded_at: datetime | None = None,
+    account: str | None = None,
 ) -> BuyResult:
-    """price 円で、amount 円以内で買える最大の株数を買う（1 株単位）。"""
+    """price 円で、amount 円以内で買える最大の株数を買う（1 株単位）。
+
+    account を省略すると NISA を優先し、枠を超える分は特定口座で買う。指定するとその口座だけで買う
+    （大胆 AI が、短期の売買を特定口座で、長く持つ銘柄を NISA で買うのに使う）。
+    """
     async with _lock:
         cash, fee_rate = await _settings(owner)
         budget = min(amount, cash)
@@ -207,8 +214,12 @@ async def buy(
             raise TradeError(
                 f"1 株も買えません（株価 {price:,.0f} 円、指定額 {amount:,.0f} 円、現金 {cash:,.0f} 円）。"
             )
-        nisa_left = await _nisa_left(owner, traded_at or market.now_jst())
-        nisa_shares = min(shares, math.floor(nisa_left / price))
+        nisa_left = await nisa_room(owner, traded_at or market.now_jst())
+        if account == "nisa":
+            shares = min(shares, math.floor(nisa_left / price))
+            if shares <= 0:
+                raise TradeError(f"今年の NISA 枠の残り（{nisa_left:,.0f} 円）では 1 株も買えません。")
+        nisa_shares = 0 if account == "tokutei" else min(shares, math.floor(nisa_left / price))
         plan = [("nisa", nisa_shares), ("tokutei", shares - nisa_shares)]
 
         fills = []

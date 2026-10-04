@@ -3,7 +3,7 @@
 - 記事: 直近 NEWS_DAYS 日の記事を社名で検索し、まだ判定していない記事を Jev で判定して news_judgements に残す（1 回 MAX_NEW_ARTICLES 件まで）
 - 既定では、自分が持っていない銘柄は「買うべきか」、持っている銘柄は「売るべきか」を聞く（慎重 AI と同じ質問）。
   どちらを聞くかは指定もできる（持っていない銘柄の売り時は「持っているとしたら」の目安）
-- 「様子見」のときは、判断し直すまでに待つ期間の目安（1週間以内〜半年・不明）も Jev に聞く
+- 今は買い時・売り時ではない（様子見・見送り・持ち続け）ときは、判断し直すまでに待つ期間の目安（1週間以内〜半年・不明）も Jev に聞く
 - Jev は理由の文章を返さないので、判断に使った材料（指標の値・記事ごとの評価）を一緒に返して表示する
 """
 
@@ -61,7 +61,7 @@ class Advice:
     holding: dict | None
     articles: list[dict] = field(default_factory=list)  # 新しい順
     new_articles: int = 0  # 今回 Jev で判定した記事の数
-    wait: str | None = None  # 様子見のときの、待つ期間の目安（WAIT_HORIZONS のキー。聞けなかったら None）
+    wait: str | None = None  # 買い時・売り時でないときの、待つ期間の目安（WAIT_HORIZONS のキー。聞けなかったら None）
 
     @property
     def level(self) -> str:
@@ -172,7 +172,7 @@ async def advise(jev: JevJudge, code: str, name: str, now: datetime, question: s
         log.warning("Jev の判定（/ask）に失敗: %s", code, exc_info=True)
         raise AdviceError("Jev の判定に失敗しました。時間をおいて再度お試しください。") from exc
     advice = Advice(code, name, question, confidence, ind, features, macd, holding, articles, new_articles)
-    if advice.level == "mid":
+    if advice.level != "high":
         try:
             advice.wait = await jev.wait_horizon(state, question)
         except Exception:  # 目安はおまけなので、聞けなくても判定は返す

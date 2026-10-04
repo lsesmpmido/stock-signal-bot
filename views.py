@@ -852,7 +852,7 @@ def advice_embed(a: advisor.Advice) -> discord.Embed:
         f"{advisor.LOW:.0%} 以下で{'持ち続け' if a.question == 'sell' else '見送り'}）",
         color=a.color,
     )
-    if a.level == "mid":
+    if a.level != "high":
         wait = WAIT_HORIZONS[a.wait][0] if a.wait else "取得できませんでした"
         embed.description += f"\n⏳ 判断し直すまでに待つ目安: **{wait}**（Jev の判定）"
     lines = []

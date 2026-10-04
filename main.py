@@ -2,7 +2,7 @@
 
 1 プロセスで次の 3 つを動かす:
   - discord.py の Bot
-  - aiohttp の /health（死活監視用）
+  - aiohttp の /health（死活監視用）と、Web のポートフォリオ画面（dashboard.py）
   - 30 秒ごとの tick で、user_settings に従って提案ジョブ・シグナルジョブを起動するスケジューラ
 """
 
@@ -25,6 +25,7 @@ import battle
 import bold_trader
 import charts
 import commands
+import dashboard
 import db
 import fiscal
 import market
@@ -184,6 +185,7 @@ class StockBot(ext_commands.Bot):
         self.relations = RelationGraph()
         self.jev: JevJudge | None = None
         self._health_runner: web.AppRunner | None = None
+        self._dashboard_user: int | None = None
         self._proposal_lock = asyncio.Lock()
         self._signal_lock = asyncio.Lock()
         self._master_lock = asyncio.Lock()
@@ -243,13 +245,22 @@ class StockBot(ext_commands.Bot):
             return web.Response(text="ok" if self.is_ready() else "starting")
 
         app = web.Application()
-        app.router.add_get("/", health)
         app.router.add_get("/health", health)
+        dashboard.Dashboard(self.dashboard_user_id).setup(app)  # / は Web のポートフォリオ画面
         self._health_runner = web.AppRunner(app, access_log=None)
         await self._health_runner.setup()
         port = int(os.getenv("PORT", "8080"))
         await web.TCPSite(self._health_runner, "0.0.0.0", port).start()
         log.info("ヘルスチェック用サーバーを起動しました (port %d)", port)
+
+    async def dashboard_user_id(self) -> int | None:
+        """Web 画面を見られるユーザー。DASHBOARD_USER_ID、未設定なら Bot の所有者（チームの所有なら、チームのオーナー）。"""
+        if configured := os.getenv("DASHBOARD_USER_ID", "").strip():
+            return int(configured)
+        if self._dashboard_user is None and self.is_ready():
+            app = await self.application_info()
+            self._dashboard_user = app.team.owner_id if app.team else app.owner.id
+        return self._dashboard_user
 
     # ------------------------------------------------------------ スケジューラ
 

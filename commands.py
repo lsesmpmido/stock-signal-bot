@@ -1,4 +1,4 @@
-"""スラッシュコマンド: /settings, /watch add|remove|list|memo|star|tag, /alert add|list|remove, /buy, /sell, /portfolio, /orders, /battle, /deposit, /reset, /chart, /ranking, /compare, /related, /map, /sentiment, /review, /test proposal|signal|report"""
+"""スラッシュコマンド: /settings, /watch add|remove|list|memo|star|tag, /alert add|list|remove, /buy, /sell, /portfolio, /orders, /battle, /deposit, /reset, /chart, /ranking, /compare, /related, /map, /sentiment, /review, /dashboard, /test proposal|signal|report"""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from discord import app_commands
 
 import battle
 import charts
+import dashboard
 import db
 import market
 import orders
@@ -715,6 +716,37 @@ async def map_command(interaction: discord.Interaction, private: bool = False) -
     await _run(interaction, private, body)
 
 
+@app_commands.command(name="dashboard", description="Web のポートフォリオ画面を開くためのリンクを、あなただけに表示します")
+@app_commands.describe(action="既定: ログイン用のリンクを出す")
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="ログイン用のリンクを出す", value="login"),
+        app_commands.Choice(name="すべての端末からログアウトする", value="logout"),
+    ]
+)
+@app_commands.default_permissions(manage_guild=True)
+async def dashboard_command(interaction: discord.Interaction, action: app_commands.Choice[str] | None = None) -> None:
+    if dashboard.base_url() is None:
+        await interaction.response.send_message("⚠️ 環境変数 `DASHBOARD_URL`（画面の URL）が設定されていません。", ephemeral=True)
+        return
+    if interaction.user.id != await interaction.client.dashboard_user_id():
+        await interaction.response.send_message("🔒 Web の画面は、許可されたユーザーだけが使えます。", ephemeral=True)
+        return
+    if action and action.value == "logout":
+        count = await db.dashboard_logout_all()
+        await interaction.response.send_message(f"✅ すべての端末からログアウトしました（{count} 件）。", ephemeral=True)
+        return
+    link = await dashboard.create_login_link(interaction.user.id)
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="📊 ポートフォリオを開く", url=link))
+    await interaction.response.send_message(
+        "下のボタンから開いてください。リンクは **5 分以内に 1 回だけ** 使えます（開いた端末は 30 日間ログインしたままになります）。"
+        "\nリンクは他の人に見せないでください。",
+        view=view,
+        ephemeral=True,
+    )
+
+
 def setup(tree: app_commands.CommandTree) -> None:
     for command in (
         settings_command,
@@ -735,6 +767,7 @@ def setup(tree: app_commands.CommandTree) -> None:
         map_command,
         sentiment_command,
         review_command,
+        dashboard_command,
     ):
         # DM には出さない（default_permissions は DM では効かないため）。実行時の確認は access.Tree で行う
         tree.add_command(app_commands.guild_only(command))

@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#16181d" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="ポートフォリオ">
+<link rel="icon" href="data:,">
+<title>ポートフォリオ</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #ffffff; --text: #1d1f23; --sub: #6b7079; --line: #e3e5e9;
+    --accent: #c0262d; --plus: #e0457b; --minus: #2f80ed; --chip: #eceef1; --chip-on: #1d1f23; --chip-on-text: #ffffff;
+    --nisa: #4caf50; --tokutei: #3b82f6; --cash: #9ca3af;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181d; --card: #20232a; --text: #eceef2; --sub: #9aa0aa; --line: #30343c;
+      --accent: #ff6b6b; --plus: #ff7aa2; --minus: #6aa8ff; --chip: #2b2f37; --chip-on: #eceef2; --chip-on-text: #16181d;
+      --nisa: #66bb6a; --tokutei: #60a5fa; --cash: #6b7280;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  header { position: sticky; top: 0; z-index: 2; background: var(--card); border-bottom: 1px solid var(--line); padding: max(12px, env(safe-area-inset-top)) 16px 0; }
+  .top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  h1 { font-size: 20px; margin: 0; }
+  #updated { color: var(--sub); font-size: 12px; }
+  .teams { display: flex; gap: 6px; margin: 10px 0; overflow-x: auto; }
+  .tabs { display: flex; }
+  .tabs button { flex: 1; background: none; border: 0; border-bottom: 3px solid transparent; padding: 10px 0; font: inherit; font-weight: 600; color: var(--sub); }
+  .tabs button.on { color: var(--text); border-bottom-color: var(--text); }
+  main { padding: 12px 16px 40px; max-width: 720px; margin: 0 auto; }
+  .card { background: var(--card); border-radius: 14px; padding: 16px; margin-bottom: 12px; }
+  .label { color: var(--sub); font-size: 13px; }
+  .big { font-size: 30px; font-weight: 700; letter-spacing: .01em; }
+  .big small { font-size: 15px; margin-left: 2px; }
+  .row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 6px 0; }
+  .row + .row { border-top: 1px solid var(--line); }
+  .plus { color: var(--plus); } .minus { color: var(--minus); }
+  .chips, .seg { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+  .chip, .seg button { border: 0; border-radius: 999px; padding: 6px 14px; background: var(--chip); color: var(--text); font: inherit; font-size: 13px; white-space: nowrap; }
+  .chip.on, .seg button.on { background: var(--chip-on); color: var(--chip-on-text); }
+  .holding { padding: 10px 0; border-top: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; }
+  .holding:first-of-type { border-top: 0; }
+  .holding .name { font-weight: 600; }
+  .holding .meta { color: var(--sub); font-size: 12px; }
+  .holding > div:first-child { min-width: 0; }
+  .holding .right { text-align: right; white-space: nowrap; }
+  .badge { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 4px; color: #fff; margin-left: 4px; vertical-align: 1px; }
+  .badge.nisa { background: var(--nisa); } .badge.tokutei { background: var(--tokutei); }
+  .bar { height: 12px; border-radius: 6px; background: var(--chip); overflow: hidden; margin: 8px 0 4px; }
+  .bar > div { height: 100%; background: var(--nisa); }
+  .chart-box { position: relative; height: 260px; }
+  .chart-box.tall { height: 340px; }
+  .note { color: var(--sub); font-size: 12px; margin-top: 8px; }
+  .hidden { display: none !important; }
+  #message { text-align: center; padding: 48px 16px; color: var(--sub); }
+  #message strong { color: var(--text); display: block; font-size: 17px; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="top"><h1>ポートフォリオ</h1><span id="updated"></span></div>
+  <div class="teams" id="teams">
+    <button class="chip" data-team="you">🧑 あなた</button>
+    <button class="chip" data-team="ai">🤖 慎重AI</button>
+    <button class="chip" data-team="ai_bold">⚡ 大胆AI</button>
+  </div>
+  <nav class="tabs">
+    <button data-tab="portfolio">ポートフォリオ</button>
+    <button data-tab="history">推移</button>
+  </nav>
+</header>
+
+<main>
+  <div id="message" class="hidden"></div>
+
+  <section id="tab-portfolio" class="hidden">
+    <div class="card">
+      <div class="label">総資産（現金＋株式の時価）</div>
+      <div class="big" id="total"></div>
+      <div class="row"><span class="label">入金額の合計</span><span id="deposits"></span></div>
+      <div class="row"><span class="label">入金額からの損益（率）</span><span id="total-return"></span></div>
+      <div class="row"><span class="label">現金</span><span id="cash"></span></div>
+    </div>
+
+    <div class="card">
+      <div class="label">国内株式の合計額</div>
+      <div class="big" id="stock"></div>
+      <div class="row"><span class="label">評価損益（率）</span><span id="unrealized"></span></div>
+      <div class="row"><span class="label">前日比（率）</span><span id="day"></span></div>
+      <div class="row"><span class="label">前月比（率）</span><span id="month"></span></div>
+    </div>
+
+    <div class="card">
+      <div class="seg" id="pie-mode">
+        <button data-pie="ticker">銘柄</button>
+        <button data-pie="account">口座区分</button>
+      </div>
+      <div class="chart-box"><canvas id="pie"></canvas></div>
+    </div>
+
+    <div class="card">
+      <div class="label" id="nisa-title"></div>
+      <div class="bar"><div id="nisa-bar"></div></div>
+      <div class="row"><span class="label">利用済み</span><span id="nisa-used"></span></div>
+      <div class="row"><span class="label">残り</span><span id="nisa-left"></span></div>
+    </div>
+
+    <div class="card">
+      <div class="seg" id="metric">
+        <button data-metric="unrealized">評価損益</button>
+        <button data-metric="day">前日比</button>
+        <button data-metric="month">前月比</button>
+      </div>
+      <div id="holdings"></div>
+    </div>
+  </section>
+
+  <section id="tab-history" class="hidden">
+    <div class="card">
+      <div class="chips" id="periods">
+        <button class="chip" data-period="1m">1か月</button>
+        <button class="chip" data-period="3m">3か月</button>
+        <button class="chip" data-period="6m">6か月</button>
+        <button class="chip" data-period="1y">1年</button>
+        <button class="chip" data-period="all">全期間</button>
+      </div>
+      <div class="seg" id="stack">
+        <button data-stack="ticker">銘柄ごと</button>
+        <button data-stack="account">NISA／特定口座</button>
+      </div>
+      <div class="chart-box tall"><canvas id="history"></canvas></div>
+      <div class="note">積み上げ棒は各日の大引け時点の時価（現金を含む）。線は入金額の合計。全期間は週ごとに間引いて表示します。</div>
+    </div>
+  </section>
+</main>
+
+<script src="{{CHART_JS}}" integrity="{{CHART_JS_SRI}}" crossorigin="anonymous" referrerpolicy="no-referrer" nonce="{{NONCE}}"></script>
+<script nonce="{{NONCE}}">
+"use strict";
+const LABELS = { you: "あなた", ai: "慎重AI", ai_bold: "大胆AI" };
+const ACCOUNT_LABELS = { nisa: "NISA", tokutei: "特定口座" };
+const PALETTE = ["#e8505b", "#f5a623", "#4caf50", "#3b82f6", "#9b59b6", "#14b8a6", "#f06292", "#8d6e63", "#78909c"];
+
+function load(key, fallback) { try { return localStorage.getItem(key) || fallback; } catch (e) { return fallback; } }
+function save(key, value) { try { localStorage.setItem(key, value); } catch (e) { /* 保存できなくても動く */ } }
+
+const state = {
+  team: load("team", "you"), tab: load("tab", "portfolio"), period: load("period", "1y"),
+  stack: load("stack", "ticker"), pie: load("pie", "ticker"), metric: load("metric", "unrealized"),
+  summary: null, history: null,
+};
+if (["#portfolio", "#history"].includes(location.hash)) state.tab = location.hash.slice(1);  // ブックマーク用
+const charts = {};
+const $ = (id) => document.getElementById(id);
+const yen = (v) => v == null ? "—" : Math.round(v).toLocaleString("ja-JP") + " 円";
+const signed = (v) => v == null ? "—" : (v > 0 ? "+" : "") + Math.round(v).toLocaleString("ja-JP") + " 円";
+const pct = (v) => v == null ? "" : `（${v > 0 ? "+" : ""}${(v * 100).toFixed(2)}%）`;
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+function setChange(el, value, rate) {
+  el.textContent = signed(value) + pct(rate);
+  el.className = value > 0 ? "plus" : value < 0 ? "minus" : "";
+}
+
+function showMessage(title, body) {
+  const m = $("message");
+  m.replaceChildren();
+  const strong = document.createElement("strong");
+  strong.textContent = title;
+  m.append(strong, document.createTextNode(body));
+  m.classList.remove("hidden");
+  $("tab-portfolio").classList.add("hidden");
+  $("tab-history").classList.add("hidden");
+}
+
+async function api(path) {
+  const r = await fetch(path, { credentials: "same-origin", cache: "no-store" });
+  if (r.status === 401) {
+    showMessage("ログインしてください", "Discord で /dashboard を実行し、表示されたリンクを開くとこの画面を見られます。");
+    throw new Error("login");
+  }
+  if (r.status === 503) {
+    showMessage("起動中です", "少し待ってから再読み込みしてください。");
+    throw new Error("starting");
+  }
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+function markOn(container, attr, value) {
+  for (const b of $(container).querySelectorAll(`[data-${attr}]`)) b.classList.toggle("on", b.dataset[attr] === value);
+}
+
+function render() {
+  markOn("teams", "team", state.team);
+  for (const b of document.querySelectorAll(".tabs button")) b.classList.toggle("on", b.dataset.tab === state.tab);
+  markOn("pie-mode", "pie", state.pie);
+  markOn("metric", "metric", state.metric);
+  markOn("periods", "period", state.period);
+  markOn("stack", "stack", state.stack);
+  $("message").classList.add("hidden");
+  $("tab-portfolio").classList.toggle("hidden", state.tab !== "portfolio");
+  $("tab-history").classList.toggle("hidden", state.tab !== "history");
+  if (state.tab === "portfolio" && state.summary) renderSummary(state.summary);
+  if (state.tab === "history" && state.history) renderHistory(state.history);
+}
+
+function renderSummary(s) {
+  $("updated").textContent = s.price_date ? `株価: ${s.price_date.slice(5).replace("-", "/")} 時点` : "";
+  $("total").textContent = yen(s.total_value);
+  $("deposits").textContent = yen(s.deposits);
+  setChange($("total-return"), s.total_value - s.deposits, s.total_return);
+  $("cash").textContent = yen(s.cash);
+  $("stock").textContent = yen(s.stock_value);
+  setChange($("unrealized"), s.unrealized, s.unrealized_rate);
+  setChange($("day"), s.day_change, s.day_rate);
+  setChange($("month"), s.month_change, s.month_rate);
+
+  $("nisa-title").textContent = `${s.year}年 NISA 成長投資枠（年間 ${(s.nisa_limit / 10000).toLocaleString("ja-JP")} 万円）`;
+  $("nisa-bar").style.width = `${Math.min(100, (s.nisa_used / s.nisa_limit) * 100)}%`;
+  $("nisa-used").textContent = yen(s.nisa_used);
+  $("nisa-left").textContent = yen(s.nisa_limit - s.nisa_used);
+
+  renderPie(s);
+  renderHoldings(s);
+}
+
+function renderPie(s) {
+  let labels, values, colors;
+  if (state.pie === "ticker") {
+    const byTicker = new Map();
+    for (const h of s.holdings) byTicker.set(h.name, (byTicker.get(h.name) || 0) + h.value);
+    labels = [...byTicker.keys(), "現金"];
+    values = [...byTicker.values(), s.cash];
+    colors = labels.map((_, i) => i === labels.length - 1 ? css("--cash") : PALETTE[i % PALETTE.length]);
+  } else {
+    const sum = (a) => s.holdings.filter((h) => h.account === a).reduce((t, h) => t + h.value, 0);
+    labels = ["NISA", "特定口座", "現金"];
+    values = [sum("nisa"), sum("tokutei"), s.cash];
+    colors = [css("--nisa"), css("--tokutei"), css("--cash")];
+  }
+  const total = values.reduce((a, b) => a + b, 0) || 1;
+  charts.pie?.destroy();
+  charts.pie = new Chart($("pie"), {
+    type: "doughnut",
+    data: { labels, datasets: [{ data: values, backgroundColor: colors, borderWidth: 0 }] },
+    options: {
+      maintainAspectRatio: false, cutout: "55%",
+      plugins: {
+        legend: { position: "bottom", labels: { color: css("--text"), boxWidth: 12 } },
+        tooltip: { callbacks: { label: (c) => `${c.label}: ${yen(c.raw)}（${((c.raw / total) * 100).toFixed(1)}%）` } },
+      },
+    },
+  });
+}
+
+function renderHoldings(s) {
+  const box = $("holdings");
+  box.replaceChildren();
+  if (!s.holdings.length) {
+    const p = document.createElement("div");
+    p.className = "note";
+    p.textContent = "保有している銘柄はありません。";
+    box.append(p);
+    return;
+  }
+  const key = { unrealized: ["unrealized", "unrealized_rate"], day: ["day_change", "day_rate"], month: ["month_change", "month_rate"] }[state.metric];
+  for (const h of s.holdings) {
+    const row = document.createElement("div");
+    row.className = "holding";
+    const left = document.createElement("div");
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = h.name;
+    const badge = document.createElement("span");
+    badge.className = `badge ${h.account}`;
+    badge.textContent = ACCOUNT_LABELS[h.account] || h.account;
+    name.append(badge);
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const price = h.price == null ? "株価なし" : `${h.price.toLocaleString("ja-JP", { maximumFractionDigits: 1 })} 円`;
+    meta.textContent = `${h.ticker} ・ ${h.shares.toLocaleString("ja-JP")} 株 ・ ${price}`;
+    left.append(name, meta);
+    const right = document.createElement("div");
+    right.className = "right";
+    const value = document.createElement("div");
+    value.className = "name";
+    value.textContent = yen(h.value);
+    const change = document.createElement("div");
+    setChange(change, h[key[0]], h[key[1]]);
+    right.append(value, change);
+    row.append(left, right);
+    box.append(row);
+  }
+}
+
+function periodStart(dates, period) {
+  if (period === "all" || !dates.length) return 0;
+  const last = new Date(`${dates[dates.length - 1]}T00:00:00Z`);
+  const months = { "1m": 1, "3m": 3, "6m": 6, "1y": 12 }[period];
+  const iso = new Date(Date.UTC(last.getUTCFullYear(), last.getUTCMonth() - months, last.getUTCDate())).toISOString().slice(0, 10);
+  const i = dates.findIndex((d) => d >= iso);
+  return i < 0 ? 0 : i;
+}
+
+function renderHistory(h) {
+  let idx = h.dates.map((_, i) => i).slice(periodStart(h.dates, state.period));
+  if (idx.length > 300) {  // 全期間などで日数が多いときは、週の最後の日だけにする
+    const weekday = (d) => new Date(`${d}T00:00:00Z`).getUTCDay();
+    idx = idx.filter((i, k) => k === idx.length - 1 || weekday(h.dates[i]) >= weekday(h.dates[idx[k + 1]]));
+  }
+  const pick = (arr) => idx.map((i) => arr[i]);
+  const labels = idx.map((i) => h.dates[i].slice(2).replaceAll("-", "/"));
+  let stacks;
+  if (state.stack === "ticker") {
+    stacks = h.tickers.map((t, n) => ({ label: t.name, data: pick(t.values), backgroundColor: PALETTE[n % PALETTE.length] }));
+  } else {
+    stacks = [
+      { label: "NISA", data: pick(h.accounts.nisa), backgroundColor: css("--nisa") },
+      { label: "特定口座", data: pick(h.accounts.tokutei), backgroundColor: css("--tokutei") },
+    ];
+  }
+  stacks.push({ label: "現金", data: pick(h.cash), backgroundColor: css("--cash") });
+  const datasets = stacks.map((d) => ({ ...d, type: "bar", stack: "assets", borderWidth: 0, barPercentage: 1, categoryPercentage: 0.9, order: 2 }));
+  datasets.push({
+    label: "入金額の合計", type: "line", data: pick(h.deposits), borderColor: css("--text"), borderWidth: 1.5,
+    borderDash: [4, 3], pointRadius: 0, stepped: true, order: 1,
+  });
+  charts.history?.destroy();
+  charts.history = new Chart($("history"), {
+    data: { labels, datasets },
+    options: {
+      maintainAspectRatio: false, animation: false,
+      interaction: { mode: "index", intersect: false },
+      scales: {
+        x: { stacked: true, ticks: { color: css("--sub"), maxTicksLimit: 6, maxRotation: 0 }, grid: { display: false } },
+        y: { stacked: true, ticks: { color: css("--sub"), callback: (v) => `${Math.round(v / 10000).toLocaleString("ja-JP")}万` }, grid: { color: css("--line") } },
+      },
+      plugins: {
+        legend: { position: "bottom", labels: { color: css("--text"), boxWidth: 12 } },
+        tooltip: {
+          filter: (item) => item.raw !== 0,
+          callbacks: {
+            label: (c) => `${c.dataset.label}: ${yen(c.raw)}`,
+            footer: (items) => `総資産: ${yen(h.total[idx[items[0].dataIndex]])}`,
+          },
+        },
+      },
+    },
+  });
+}
+
+async function refresh() {
+  try {
+    if (state.tab === "portfolio") state.summary = await api(`/api/summary?team=${state.team}`);
+    else state.history = await api(`/api/history?team=${state.team}`);
+    render();
+  } catch (e) {
+    if (e.message !== "login" && e.message !== "starting") showMessage("読み込めませんでした", String(e.message));
+  }
+}
+
+function bind(container, attr, onChange) {
+  $(container).addEventListener("click", (ev) => {
+    const b = ev.target.closest(`[data-${attr}]`);
+    if (b) onChange(b.dataset[attr]);
+  });
+}
+
+bind("teams", "team", (v) => { state.team = v; state.summary = state.history = null; save("team", v); refresh(); });
+for (const b of document.querySelectorAll(".tabs button")) {
+  b.addEventListener("click", () => {
+    state.tab = b.dataset.tab; save("tab", state.tab);
+    if ((state.tab === "portfolio" && !state.summary) || (state.tab === "history" && !state.history)) refresh(); else render();
+  });
+}
+bind("pie-mode", "pie", (v) => { state.pie = v; save("pie", v); render(); });
+bind("metric", "metric", (v) => { state.metric = v; save("metric", v); render(); });
+bind("periods", "period", (v) => { state.period = v; save("period", v); render(); });
+bind("stack", "stack", (v) => { state.stack = v; save("stack", v); render(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { state.summary = state.history = null; refresh(); } });
+if (!window.Chart) showMessage("グラフを読み込めませんでした", "通信環境を確かめて、再読み込みしてください。");
+else refresh();
+</script>
+</body>
+</html>

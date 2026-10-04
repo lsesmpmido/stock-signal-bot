@@ -253,6 +253,19 @@ CREATE TABLE IF NOT EXISTS split_events (
     notified_at TIMESTAMPTZ,
     PRIMARY KEY (ticker, ex_date)
 );
+-- Web 画面のログイン。どちらも値そのものではなくハッシュだけを保存する
+CREATE TABLE IF NOT EXISTS dashboard_tokens (  -- /dashboard で出す 1 回限りのログイン用リンク
+    token_hash TEXT PRIMARY KEY,
+    user_id    BIGINT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at    TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS dashboard_sessions (
+    session_hash TEXT PRIMARY KEY,
+    user_id      BIGINT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMPTZ NOT NULL
+);
 -- テーブルを REST API などで外部公開するサービスでも第三者に読み書きされないよう、RLS を有効化しておく。
 -- (Bot はテーブル所有者のロールで接続するので RLS の影響を受けない)
 ALTER TABLE pending_stocks   ENABLE ROW LEVEL SECURITY;
@@ -272,6 +285,8 @@ ALTER TABLE news_judgements  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE quizzes          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE fiscal_ends      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE split_events     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE dashboard_tokens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE dashboard_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE quiz_answers     ENABLE ROW LEVEL SECURITY;
 """
 
@@ -681,6 +696,11 @@ async def mark_split_notified(ticker: str, ex_date: date) -> None:
         await conn.execute(
             "UPDATE split_events SET notified_at = now() WHERE ticker = %s AND ex_date = %s", (ticker, ex_date)
         )
+
+
+async def all_splits() -> list[dict[str, Any]]:
+    async with _pool_or_raise().connection() as conn:
+        return await (await conn.execute("SELECT ticker, ex_date, ratio FROM split_events")).fetchall()
 
 
 async def prune_prices(before: date) -> int:
@@ -1111,3 +1131,56 @@ async def close_alert(alert_id: int, triggered: bool) -> bool:
             (triggered, alert_id),
         )
         return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------- Web 画面のログイン（dashboard_tokens / dashboard_sessions）
+
+
+async def dashboard_add_token(token_hash: str, user_id: int, expires_at: datetime) -> None:
+    async with _pool_or_raise().connection() as conn:
+        await conn.execute("DELETE FROM dashboard_tokens WHERE expires_at < now()")  # 期限切れを片付ける
+        await conn.execute(
+            "INSERT INTO dashboard_tokens (token_hash, user_id, expires_at) VALUES (%s, %s, %s)",
+            (token_hash, user_id, expires_at),
+        )
+
+
+async def dashboard_use_token(token_hash: str) -> int | None:
+    """有効なログイン用リンクなら使用済みにしてユーザー ID を返す。期限切れ・使用済み・存在しなければ None。"""
+    async with _pool_or_raise().connection() as conn:
+        row = await (
+            await conn.execute(
+                "UPDATE dashboard_tokens SET used_at = now() "
+                "WHERE token_hash = %s AND used_at IS NULL AND expires_at > now() RETURNING user_id",
+                (token_hash,),
+            )
+        ).fetchone()
+    return row["user_id"] if row else None
+
+
+async def dashboard_add_session(session_hash: str, user_id: int, expires_at: datetime) -> None:
+    async with _pool_or_raise().connection() as conn:
+        await conn.execute("DELETE FROM dashboard_sessions WHERE expires_at < now()")
+        await conn.execute(
+            "INSERT INTO dashboard_sessions (session_hash, user_id, expires_at) VALUES (%s, %s, %s)",
+            (session_hash, user_id, expires_at),
+        )
+
+
+async def dashboard_session_user(session_hash: str) -> int | None:
+    async with _pool_or_raise().connection() as conn:
+        row = await (
+            await conn.execute(
+                "SELECT user_id FROM dashboard_sessions WHERE session_hash = %s AND expires_at > now()", (session_hash,)
+            )
+        ).fetchone()
+    return row["user_id"] if row else None
+
+
+async def dashboard_logout_all() -> int:
+    """すべてのセッションと、まだ使っていないログイン用リンクを無効にし、無効にしたセッションの数を返す。"""
+    async with _pool_or_raise().connection() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM dashboard_tokens")
+            cur = await conn.execute("DELETE FROM dashboard_sessions")
+            return cur.rowcount

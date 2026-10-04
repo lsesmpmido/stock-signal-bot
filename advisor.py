@@ -1,7 +1,8 @@
 """/ask: 指定した銘柄が今買い時か売り時かを、集めた記事と値動き（RSI・MACD など）から Jev に判定させる。
 
 - 記事: 直近 NEWS_DAYS 日の記事を社名で検索し、まだ判定していない記事を Jev で判定して news_judgements に残す（1 回 MAX_NEW_ARTICLES 件まで）
-- 自分が持っていない銘柄は「買うべきか」、持っている銘柄は「売るべきか」を聞く（慎重 AI と同じ質問）
+- 既定では、自分が持っていない銘柄は「買うべきか」、持っている銘柄は「売るべきか」を聞く（慎重 AI と同じ質問）。
+  どちらを聞くかは指定もできる（持っていない銘柄の売り時は「持っているとしたら」の目安）
 - Jev は理由の文章を返さないので、判断に使った材料（指標の値・記事ごとの評価）を一緒に返して表示する
 """
 
@@ -133,7 +134,8 @@ async def _holding(code: str, df: pd.DataFrame, today) -> dict | None:
     }
 
 
-async def advise(jev: JevJudge, code: str, name: str, now: datetime) -> Advice:
+async def advise(jev: JevJudge, code: str, name: str, now: datetime, question: str | None = None) -> Advice:
+    """question は "buy"（買うべきか）/ "sell"（売るべきか）。None なら、持っていれば sell、なければ buy。"""
     df = (await market.get_daily([code])).get(code)
     if df is None or len(df) < 80:
         raise AdviceError(f"{name} ({code}) の株価データを十分に取得できませんでした。")
@@ -154,12 +156,16 @@ async def advise(jev: JevJudge, code: str, name: str, now: datetime) -> Advice:
         for a in articles[:MAX_NEWS_FOR_JEV]
     ]
     state = {"company": name, **features, "macd": macd, "recent_news": recent_news or "直近 7 日の記事なし"}
+    question = question or ("sell" if holding else "buy")
+    if holding:
+        state["holding"] = {"return_rate": round(holding["return_rate"], 4), "held_trading_days": holding["held_trading_days"]}
+    elif question == "sell":
+        state["holding"] = "保有していない。持っているとしたら、値動きと材料から今売るべきかを判断する"
     try:
-        if holding:
-            state["holding"] = {"return_rate": round(holding["return_rate"], 4), "held_trading_days": holding["held_trading_days"]}
-            question, confidence = "sell", await jev.should_sell(state)
+        if question == "sell":
+            confidence = await jev.should_sell(state)
         else:
-            question, confidence = "buy", await jev.should_buy({**state, "sources": ["あなたからの質問"]})
+            confidence = await jev.should_buy({**state, "sources": ["あなたからの質問"]})
     except Exception as exc:
         log.warning("Jev の判定（/ask）に失敗: %s", code, exc_info=True)
         raise AdviceError("Jev の判定に失敗しました。時間をおいて再度お試しください。") from exc

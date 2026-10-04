@@ -679,13 +679,23 @@ async def sentiment_command(interaction: discord.Interaction, code: str, private
 
 
 @app_commands.command(name="ask", description="その銘柄が今買い時か売り時かを、記事と RSI・MACD などの値動きから判定します")
-@app_commands.describe(code="証券コード（例: 7203）", private=PRIVATE_DESC)
+@app_commands.describe(code="証券コード（例: 7203）", question="聞くこと（既定: 持っていれば売り時か、なければ買い時か）", private=PRIVATE_DESC)
+@app_commands.choices(
+    question=[
+        app_commands.Choice(name="買い時か", value="buy"),
+        app_commands.Choice(name="売り時か", value="sell"),
+    ]
+)
 @app_commands.default_permissions(manage_guild=True)
-async def ask_command(interaction: discord.Interaction, code: str, private: bool = False) -> None:
+async def ask_command(
+    interaction: discord.Interaction, code: str, question: app_commands.Choice[str] | None = None, private: bool = False
+) -> None:
     async def body():
         c, name = await _resolve(interaction, code)
         try:
-            advice = await advisor.advise(interaction.client.jev, c, name, market.now_jst())
+            advice = await advisor.advise(
+                interaction.client.jev, c, name, market.now_jst(), question.value if question else None
+            )
         except advisor.AdviceError as exc:
             raise CommandError(str(exc)) from None
         png = await asyncio.to_thread(charts.detailed_chart, c, name, advice.ind)

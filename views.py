@@ -841,7 +841,10 @@ def _rsi_word(rsi: float | None) -> str:
 
 def advice_embed(a: advisor.Advice) -> discord.Embed:
     f, m = a.features, a.macd
-    asked = "売るべきか（保有中）" if a.question == "sell" else "買うべきか"
+    if a.question == "sell":
+        asked = "売るべきか（保有中）" if a.holding else "売るべきか（保有していないため、持っているとしたらの目安）"
+    else:
+        asked = "買うべきか（買い増し）" if a.holding else "買うべきか"
     embed = discord.Embed(
         title=f"🔎 {a.name} ({a.code}) の判定: {a.verdict}",
         description=f"Jev の「今{asked}」の確信度: **{a.confidence:.0%}**"

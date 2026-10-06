@@ -3,6 +3,7 @@
 - 候補: 直近 10 営業日の提案銘柄、自分の監視銘柄、自分が仮想で買った銘柄（保有中と直近 20 営業日の購入）
 - 高値づかみを防ぐ安全ルールで候補を絞り、Jev に「買うべきか」を判断させる
 - 保有銘柄は、安全ルール（損切り・最長保有）と Jev の「売るべきか」の判断で売る。最長保有は特定口座の分だけに当てる
+- NISA の保有は、売っても今年の枠が戻らないので、Jev に口座を伝え、売りの基準を NISA_SELL_MARGIN だけ高くする
 - NISA で買った保有は、買ってから portfolio.NISA_MIN_HOLD_DAYS 営業日は損切り以外で売らない（入れ替えにも使わない）
 - 現金が足りなければ、保有で最も見劣りする銘柄より明らかに良い候補だけ入れ替える
 - 注文はすべて翌取引日の始値で約定する（orders.fill_open_orders）
@@ -35,6 +36,7 @@ PROPOSAL_WINDOW = 10  # 提案から何営業日まで候補にするか
 YOUR_BUY_WINDOW = 20  # 自分が買ってから何営業日まで候補にするか
 STOP_LOSS = -0.15
 MAX_HOLD_DAYS = 120  # 営業日。特定口座の保有だけに当てる（NISA は長く持つ前提）
+NISA_SELL_MARGIN = 0.15  # NISA の保有は、Jev の「売る」の確信度がモードの基準をこれだけ上回るときだけ売る
 REPLACE_MARGIN = 0.15  # 入れ替えは、候補の確信度が保有の「持ち続ける確信度」をこれ以上上回るときだけ
 MAX_BUYS_PER_DAY = 3
 MAX_CANDIDATES = 30  # Jev に問い合わせる候補の上限（1 日の呼び出し回数を抑える）
@@ -53,6 +55,11 @@ class Mode:
     max_ma_gap: float  # 25 日線からこれ以上上に離れていたら買わない
     take_profit: float | None = None  # これ以上の含み益で利益確定する（堅実モード）
     follow_you: bool = False  # 自分の買い方のクセに近い候補を優先する（弟子モード）
+
+    @property
+    def nisa_sell_threshold(self) -> float:
+        """NISA の保有を売る、Jev の「売る」の確信度の基準（売っても今年の枠が戻らないので高め）。"""
+        return round(self.sell_threshold + NISA_SELL_MARGIN, 2)
 
 
 MODES = {
@@ -283,7 +290,12 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
         elif mode.take_profit is not None and h.return_rate >= mode.take_profit:
             reason = f"利益確定（{h.return_rate:+.1%}）"
         else:
-            holding = {"return_rate": round(h.return_rate, 4), "held_trading_days": h.held_days}
+            accounts = sorted({p["account"] for p in h.positions}, key=lambda a: a != "nisa")
+            holding = {
+                "return_rate": round(h.return_rate, 4),
+                "held_trading_days": h.held_days,
+                "account": "・".join(portfolio.ACCOUNT_LABELS[a] for a in accounts),
+            }
             state = {"company": h.name, "holding": holding, **h.features}
             try:
                 confidence = await jev.should_sell(state)
@@ -294,8 +306,16 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
             decisions.judged += 1
             h.sell_confidence = confidence
             h.keep = 1 - confidence
-            if confidence >= mode.sell_threshold:
+            # NISA の分は、売りの基準を高くする（基準の間なら、特定口座の分だけ売る）
+            nisa_threshold = mode.nisa_sell_threshold
+            has_nisa = len(tokutei) < len(h.positions)
+            if confidence >= nisa_threshold or (not has_nisa and confidence >= mode.sell_threshold):
                 reason = "Jev の判断"
+            elif confidence >= mode.sell_threshold and tokutei:
+                to_sell = tokutei
+                reason = f"Jev の判断。特定口座の分だけ売り、NISA の分は持ち続ける（NISA は {nisa_threshold:.0%} 以上で売る）"
+            elif confidence >= mode.sell_threshold:
+                h.note = f"NISA のため持ち続ける（NISA は {nisa_threshold:.0%} 以上で売る）"
         if reason:
             decisions.sells.append((h, to_sell, reason, confidence))
             selling.add(h.ticker)
@@ -390,6 +410,7 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
             "mode": mode.label,
             "buy_threshold": mode.buy_threshold,
             "sell_threshold": mode.sell_threshold,
+            "nisa_sell_threshold": mode.nisa_sell_threshold,
             "judged": decisions.judged,
             "entries": decisions.log,
         },

@@ -538,6 +538,8 @@ def ai_decisions_embed(record: dict) -> discord.Embed:
     criteria = data.get("criteria") or (
         f"買いの確信度 {data['buy_threshold']:.0%} 以上 ・ 売りの確信度 {data['sell_threshold']:.0%} 以上"
     )
+    if "nisa_sell_threshold" in data:
+        criteria += f"（NISA は {data['nisa_sell_threshold']:.0%} 以上）"
     embed.description = (
         f"{headline}\n"
         f"持ち続け {len(holds)} ・ 見送り {len(passes)} ・ 安全ルールで除外 {len(blocked)} ・ Jev の判定 {data['judged']} 件\n"

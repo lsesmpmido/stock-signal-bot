@@ -45,7 +45,7 @@ TAKE_PROFIT = 0.06
 STOP_LOSS = -0.04
 TRAILING_STOP = 0.03  # 含み益が出た後、保有中の最高値からこれだけ下がったら売る
 MAX_SHORT_DAYS = 5  # 短期の保有の最長（営業日）
-LONG_SELL_THRESHOLD = 0.65  # 長期の保有を、大引け後の Jev の「売る」の確信度がこれ以上なら売る
+LONG_SELL_THRESHOLD = 0.80  # 長期（NISA）の保有を、大引け後の Jev の「売る」の確信度がこれ以上なら売る（NISA の枠は売っても戻らないので高め）
 STYLE_LABELS = {"tokutei": "短期（特定口座）", "nisa": "長期（NISA）"}
 CRITERIA = (
     f"買い: 短期の確信度 {SHORT_THRESHOLD:.0%} 以上（特定口座）・ 長期 {LONG_THRESHOLD:.0%} 以上（NISA） ・ "
@@ -333,7 +333,8 @@ async def after_close(jev: JevJudge, now: datetime) -> None:
             record["entries"].append({**entry, "action": "hold", "confidence": None, "note": note})
             continue
         elif await _use_jev(today):
-            state = {"company": p["company_name"], "holding": {"return_rate": round(rate, 4), "held_trading_days": held}, **f}
+            holding = {"return_rate": round(rate, 4), "held_trading_days": held, "account": portfolio.ACCOUNT_LABELS[p["account"]]}
+            state = {"company": p["company_name"], "holding": holding, **f}
             try:
                 confidence = await jev.should_sell(state)
                 record["judged"] += 1

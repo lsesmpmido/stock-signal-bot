@@ -3,6 +3,7 @@
 - 候補: 直近 10 営業日の提案銘柄、自分の監視銘柄、自分が仮想で買った銘柄（保有中と直近 20 営業日の購入）
 - 高値づかみを防ぐ安全ルールで候補を絞り、Jev に「買うべきか」を判断させる
 - 保有銘柄は、安全ルール（損切り・最長保有）と Jev の「売るべきか」の判断で売る
+- NISA で買った保有は、買ってから portfolio.NISA_MIN_HOLD_DAYS 営業日は損切り以外で売らない（入れ替えにも使わない）
 - 現金が足りなければ、保有で最も見劣りする銘柄より明らかに良い候補だけ入れ替える
 - 注文はすべて翌取引日の始値で約定する（orders.fill_open_orders）
 - 例外として、損切りだけは取引時間中にも調べ、含み損が基準に達したらその場の株価ですぐ売る（intraday_stop_loss）
@@ -255,10 +256,16 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
         h.held_days = max(h.held_days, market.trading_days_between(p["opened_at"].astimezone(JST).date(), today))
 
     selling: set[str] = set()
+    locked: set[str] = set()  # NISA の最低保有期間中で、損切り以外では売らない銘柄
     for h in holdings.values():
         reason, confidence = None, None
+        lock_left = portfolio.nisa_lock_left(h.positions, today)
         if h.return_rate <= STOP_LOSS:
             reason = f"損切り（{h.return_rate:+.1%}）"
+        elif lock_left:
+            locked.add(h.ticker)
+            h.note = f"NISA の最低保有期間中（あと {lock_left} 営業日は損切り以外で売らない）"
+            continue
         elif h.held_days >= MAX_HOLD_DAYS:
             reason = f"最長保有（{h.held_days} 営業日）"
         elif mode.take_profit is not None and h.return_rate >= mode.take_profit:
@@ -337,7 +344,7 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
         if len(decisions.buys) >= MAX_BUYS_PER_DAY:
             stop = f"1 日に買う上限（{MAX_BUYS_PER_DAY} 件）に達した"
         elif cash < mode.amount * 0.5:
-            keepers = [h for h in holdings.values() if h.ticker not in selling]
+            keepers = [h for h in holdings.values() if h.ticker not in selling and h.ticker not in locked]
             if not keepers:
                 stop = "現金が足りない"
             else:

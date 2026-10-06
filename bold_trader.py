@@ -4,7 +4,8 @@
 - きっかけ（どれか）に当たった銘柄だけ Jev に聞く: 前日比 +3% 以上、出来高が 20 日平均の 2 倍以上、プラス材料の新しい提案
 - Jev に短期（数日）と長期（数か月以上）の確信度を聞き、長期向きなら NISA、短期向きなら特定口座で買う（NISA の枠を短期売買で使わない）
 - 短期（特定口座）の保有: 利益確定 +6%、損切り -4%、含み益が出た後に最高値から -3%、最長 5 営業日で売る
-- 長期（NISA）の保有: 慎重 AI と同じく -15% で損切りし、大引け後に Jev の「売るべきか」で見直す（翌取引日の始値で売る）
+- 長期（NISA）の保有: 慎重 AI と同じく -15% で損切りし、大引け後に Jev の「売るべきか」で見直す（翌取引日の始値で売る）。
+  買ってから portfolio.NISA_MIN_HOLD_DAYS 営業日は損切り以外で売らない（Jev にも聞かない）
 - 売買しすぎを防ぐ: 買いは 1 日 2 件まで、保有は 6 銘柄まで、売った銘柄は 3 営業日買い直さない、
   税金・手数料を引いても見込みがプラスのときだけ買う、同じ銘柄を Jev に聞くのは 1 日 1 回まで、Jev の呼び出しは 1 日の上限まで
 - その日の判断（売買・見送り）は 1 日分を ai_decisions にまとめ、翌取引日の朝に慎重 AI の判断と並べて知らせる
@@ -324,8 +325,13 @@ async def after_close(jev: JevJudge, now: datetime) -> None:
             record["entries"].append({**entry, "action": "hold", "confidence": None, "note": "短期: 明日も場中のルールで判断"})
             continue
         reason, confidence = None, None
+        lock_left = portfolio.nisa_lock_left([p], today)
         if rate <= ai_trader.STOP_LOSS:
             reason = f"損切り（{rate:+.1%}）"
+        elif lock_left:
+            note = f"NISA の最低保有期間中（あと {lock_left} 営業日は損切り以外で売らない）"
+            record["entries"].append({**entry, "action": "hold", "confidence": None, "note": note})
+            continue
         elif await _use_jev(today):
             state = {"company": p["company_name"], "holding": {"return_rate": round(rate, 4), "held_trading_days": held}, **f}
             try:

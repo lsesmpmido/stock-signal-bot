@@ -30,6 +30,7 @@ log = logging.getLogger(__name__)
 
 NISA_ANNUAL_LIMIT = 2_400_000
 TAX_RATE = 0.20315
+NISA_MIN_HOLD_DAYS = 20  # AI は NISA で買った保有を、この営業日数（約 1 か月）は損切り以外で売らない
 ACCOUNT_LABELS = {"nisa": "NISA", "tokutei": "特定口座"}
 OWNER_LABELS = {"you": "あなた", "ai": "慎重AI", "ai_bold": "大胆AI"}
 OWNER_ICONS = {"you": "🧑", "ai": "🤖", "ai_bold": "⚡"}
@@ -204,6 +205,16 @@ def nisa_preset(settings: dict[str, str], year: int) -> float:
     """勝負を始める前に、その年に使っていた NISA 枠（初期条件の設定で登録したもの）。"""
     preset_year, _, amount = settings.get("vp_nisa_preset", "").partition(":")
     return float(amount) if preset_year == str(year) and amount else 0.0
+
+
+def nisa_lock_left(positions: list[dict], today: date) -> int:
+    """NISA の保有が、AI が損切り以外で売ってよくなるまでの残りの営業日数（NISA の保有がなければ 0）。"""
+    held = [
+        market.trading_days_between(p["opened_at"].astimezone(JST).date(), today)
+        for p in positions
+        if p["account"] == "nisa"
+    ]
+    return max(0, NISA_MIN_HOLD_DAYS - min(held)) if held else 0
 
 
 async def nisa_room(owner: str, when: datetime) -> float:

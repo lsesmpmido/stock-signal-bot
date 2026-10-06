@@ -313,11 +313,11 @@ async def plan_start(
 
 
 def long_held(plan: StartPlan, today: date) -> list[StartHolding]:
-    """AI の最長保有（営業日）をすでに過ぎていて、翌取引日に AI が売る保有。"""
+    """AI の最長保有（営業日）をすでに過ぎていて、翌取引日に AI が売る保有（最長保有は特定口座だけ）。"""
     return [
         h
         for h in plan.holdings
-        if market.trading_days_between(h.opened_on, today) >= ai_trader.MAX_HOLD_DAYS
+        if h.account == "tokutei" and market.trading_days_between(h.opened_on, today) >= ai_trader.MAX_HOLD_DAYS
     ]
 
 

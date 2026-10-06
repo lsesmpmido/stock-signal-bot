@@ -2,7 +2,7 @@
 
 - 候補: 直近 10 営業日の提案銘柄、自分の監視銘柄、自分が仮想で買った銘柄（保有中と直近 20 営業日の購入）
 - 高値づかみを防ぐ安全ルールで候補を絞り、Jev に「買うべきか」を判断させる
-- 保有銘柄は、安全ルール（損切り・最長保有）と Jev の「売るべきか」の判断で売る
+- 保有銘柄は、安全ルール（損切り・最長保有）と Jev の「売るべきか」の判断で売る。最長保有は特定口座の分だけに当てる
 - NISA で買った保有は、買ってから portfolio.NISA_MIN_HOLD_DAYS 営業日は損切り以外で売らない（入れ替えにも使わない）
 - 現金が足りなければ、保有で最も見劣りする銘柄より明らかに良い候補だけ入れ替える
 - 注文はすべて翌取引日の始値で約定する（orders.fill_open_orders）
@@ -34,7 +34,7 @@ OWNER = "ai"
 PROPOSAL_WINDOW = 10  # 提案から何営業日まで候補にするか
 YOUR_BUY_WINDOW = 20  # 自分が買ってから何営業日まで候補にするか
 STOP_LOSS = -0.15
-MAX_HOLD_DAYS = 120  # 営業日
+MAX_HOLD_DAYS = 120  # 営業日。特定口座の保有だけに当てる（NISA は長く持つ前提）
 REPLACE_MARGIN = 0.15  # 入れ替えは、候補の確信度が保有の「持ち続ける確信度」をこれ以上上回るときだけ
 MAX_BUYS_PER_DAY = 3
 MAX_CANDIDATES = 30  # Jev に問い合わせる候補の上限（1 日の呼び出し回数を抑える）
@@ -97,11 +97,16 @@ class HoldingView:
     def return_rate(self) -> float:
         return self.value / self.cost - 1 if self.cost else 0.0
 
+    def value_of(self, positions: list[dict]) -> float:
+        """一部の口座の分の時価（株数で按分する）。"""
+        total = sum(p["shares"] for p in self.positions)
+        return self.value * sum(p["shares"] for p in positions) / total if total else 0.0
+
 
 @dataclass
 class Decisions:
     mode: Mode
-    sells: list[tuple[HoldingView, str, float | None]] = field(default_factory=list)  # (保有, 理由, 確信度)
+    sells: list[tuple[HoldingView, list[dict], str, float | None]] = field(default_factory=list)  # (保有, 売る口座の分, 理由, 確信度)
     buys: list[Candidate] = field(default_factory=list)
     skipped_by_rules: int = 0
     judged: int = 0
@@ -259,15 +264,22 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
     locked: set[str] = set()  # NISA の最低保有期間中で、損切り以外では売らない銘柄
     for h in holdings.values():
         reason, confidence = None, None
+        to_sell = h.positions
         lock_left = portfolio.nisa_lock_left(h.positions, today)
+        # 最長保有は特定口座の分だけに当てる（NISA は長く持つ前提）
+        tokutei = [p for p in h.positions if p["account"] == "tokutei"]
+        tokutei_days = max((market.trading_days_between(p["opened_at"].astimezone(JST).date(), today) for p in tokutei), default=0)
         if h.return_rate <= STOP_LOSS:
             reason = f"損切り（{h.return_rate:+.1%}）"
         elif lock_left:
             locked.add(h.ticker)
             h.note = f"NISA の最低保有期間中（あと {lock_left} 営業日は損切り以外で売らない）"
             continue
-        elif h.held_days >= MAX_HOLD_DAYS:
-            reason = f"最長保有（{h.held_days} 営業日）"
+        elif tokutei_days >= MAX_HOLD_DAYS:
+            to_sell = tokutei
+            reason = f"最長保有（{tokutei_days} 営業日）"
+            if len(tokutei) < len(h.positions):
+                reason += "。特定口座の分だけ売り、NISA の分は持ち続ける"
         elif mode.take_profit is not None and h.return_rate >= mode.take_profit:
             reason = f"利益確定（{h.return_rate:+.1%}）"
         else:
@@ -285,7 +297,7 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
             if confidence >= mode.sell_threshold:
                 reason = "Jev の判断"
         if reason:
-            decisions.sells.append((h, reason, confidence))
+            decisions.sells.append((h, to_sell, reason, confidence))
             selling.add(h.ticker)
 
     # ---- 候補の評価
@@ -333,10 +345,10 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
 
     # ---- 注文（売り → 買い。現金が足りなければ入れ替え）
     cash = float((await db.get_all_settings())[db.CASH_KEYS[OWNER]])
-    for h, reason, confidence in decisions.sells:
-        for p in h.positions:
+    for h, to_sell, reason, confidence in decisions.sells:
+        for p in to_sell:
             await orders.place_sell(OWNER, h.ticker, None, p["account"], reason, confidence)
-        cash += h.value
+        cash += h.value_of(to_sell)
 
     eligible = sorted((c for c in usable if c.score >= mode.buy_threshold), key=lambda c: c.score, reverse=True)
     for i, c in enumerate(eligible):
@@ -362,7 +374,7 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
             reason = f"入れ替え（{c.name} を買うため）"
             for p in weakest.positions:
                 await orders.place_sell(OWNER, weakest.ticker, None, p["account"], reason, 1 - weakest.keep)
-            decisions.sells.append((weakest, reason, 1 - weakest.keep))
+            decisions.sells.append((weakest, weakest.positions, reason, 1 - weakest.keep))
             selling.add(weakest.ticker)
             cash += weakest.value
         amount = min(mode.amount, cash)
@@ -396,7 +408,7 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
 def _decision_log(decisions: Decisions, holdings: dict[str, HoldingView], candidates: dict[str, Candidate]) -> list[dict]:
     """銘柄ごとの判断。action は sell / hold / buy / pass（見送り）/ blocked（安全ルール）/ skipped（判定せず）。"""
     entries = []
-    sold = {h.ticker: (reason, confidence) for h, reason, confidence in decisions.sells}
+    sold = {h.ticker: (reason, confidence) for h, _, reason, confidence in decisions.sells}
     for h in holdings.values():
         position = f"含み損益 {h.return_rate:+.1%} ・ 保有 {h.held_days} 営業日"
         entry = {"ticker": h.ticker, "name": h.name, "facts": f"{position} ・ {facts(h.features)}"}

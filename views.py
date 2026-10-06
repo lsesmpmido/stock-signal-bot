@@ -702,7 +702,7 @@ def reset_plan_embed(plan: battle.StartPlan, now: datetime, done: bool = False) 
             names = "、".join(h.company_name for h in old)
             embed.add_field(
                 name="ℹ️ AI の売買ルール",
-                value=f"{names} は AI の最長保有（{ai_trader.MAX_HOLD_DAYS} 営業日）を過ぎているため、AI は次の判断で売ります。",
+                value=f"{names}（特定口座）は AI の最長保有（{ai_trader.MAX_HOLD_DAYS} 営業日）を過ぎているため、AI は次の判断で売ります。",
                 inline=False,
             )
     embed.set_footer(

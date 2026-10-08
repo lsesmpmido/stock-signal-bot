@@ -171,8 +171,11 @@ def _split_factor(splits: list[dict], ticker: str, traded_on: date) -> float:
     return factor
 
 
-async def history_data(team: str) -> dict[str, Any]:
-    """日ごとの保有（銘柄ごと・口座ごとの時価）と現金・入金額の合計。今の保有と現金から、売買と入金を逆にたどって求める。"""
+async def history_data(team: str, max_tickers: int | None = MAX_TICKERS) -> dict[str, Any]:
+    """日ごとの保有（銘柄ごと・口座ごとの時価）と現金・入金額の合計。今の保有と現金から、売買と入金を逆にたどって求める。
+
+    max_tickers を超える銘柄は「その他」にまとめる（None ならまとめない）。
+    """
     settings = await db.get_all_settings()
     started_on = datetime.fromisoformat(settings["vp_started_at"]).astimezone(JST).date()
     start_holdings = portfolio.start_holdings(settings)
@@ -266,9 +269,10 @@ async def history_data(team: str) -> dict[str, Any]:
     for o in outside:
         names[f"outside:{o['name']}"] = f"{o['name']}（ゲーム外）"
     ranked = sorted(by_ticker, key=lambda t: max(by_ticker[t]), reverse=True)
-    tickers = [{"ticker": t, "name": names.get(t, t), "values": by_ticker[t]} for t in ranked[:MAX_TICKERS]]
-    if len(ranked) > MAX_TICKERS:
-        rest = [sum(by_ticker[t][k] for t in ranked[MAX_TICKERS:]) for k in range(len(states))]
+    limit = len(ranked) if max_tickers is None else max_tickers
+    tickers = [{"ticker": t, "name": names.get(t, t), "values": by_ticker[t]} for t in ranked[:limit]]
+    if len(ranked) > limit:
+        rest = [sum(by_ticker[t][k] for t in ranked[limit:]) for k in range(len(states))]
         tickers.append({"ticker": "", "name": "その他", "values": rest})
     return {
         "team": team,

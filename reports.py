@@ -5,13 +5,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+import io
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import discord
 import pandas as pd
 
 import battle
+import charts
+import dashboard
 import db
 import fiscal
 import glossary
@@ -19,6 +23,7 @@ import market
 import portfolio
 import review
 import signals
+import thresholds
 from jev_client import CATEGORIES
 from market import JST
 
@@ -281,6 +286,252 @@ async def weekly_look_back(now: datetime) -> discord.Embed:
     embed.add_field(name="監視・保有銘柄の今週の騰落", value=_ranking(moves), inline=False)
     embed.set_footer(text="このメッセージのスレッドに、今週のメモを書き込めます")
     return embed
+
+
+# ---- 週末の振り返り: AI の買いの基準の答え合わせと、損益の推移
+
+MAX_PNL_STOCKS = 5  # 振り返りに載せる、チームごとの「今週の損益が大きかった銘柄」の数
+SAME_RATE = 0.10  # 買う判断と見送りで、上がった割合の差がこれ未満なら「確信度で見分けられていない」とみなす
+VERDICT_MIN = 3  # 比べる 2 つのどちらかがこの件数未満なら、判定を書かない
+
+
+@dataclass
+class Tally:
+    """候補のその後の値動きを、上がった・下がった（変わらずを含む）に分けたもの。"""
+
+    up: list[float] = field(default_factory=list)
+    down: list[float] = field(default_factory=list)
+
+    def add(self, change: float) -> None:
+        (self.up if change > 0 else self.down).append(change)
+
+    @property
+    def count(self) -> int:
+        return len(self.up) + len(self.down)
+
+    @property
+    def up_rate(self) -> float | None:
+        return len(self.up) / self.count if self.count else None
+
+    @property
+    def mean(self) -> float | None:
+        return sum(self.up + self.down) / self.count if self.count else None
+
+
+def _would_buy(owner: str, data: dict, entry: dict) -> bool:
+    """判断した当時の基準で「買う判断」だったか（1 日の上限や現金が足りずに買えなかった候補も含む）。"""
+    if owner == "ai":
+        return entry["confidence"] + (entry.get("bonus") or 0.0) >= float(data["buy_threshold"])
+    return entry["action"] == "buy" or "買いの基準に届かない" not in (entry.get("note") or "")
+
+
+async def trade_review(week_start: datetime) -> dict[str, dict[str, Tally]]:
+    """今週の AI の判断を、買う判断・見送り・売る判断・持ち続けに分け、その後に上がったか下がったかを数える。
+
+    - 値動きは、判断した日の終値から直近の終値まで（税金・手数料は含めない）
+    - 同じ銘柄を何度も判断していたら、今週最初の判断で数える。ただし今週売った保有は、売る判断だけで数える
+    - 売る判断には、Jev の判断のほか、損切り・利益確定・最長保有・入れ替えなどのルールで売ったものも含める
+    """
+    first: dict[tuple[str, str, str], tuple] = {}  # (持ち主, 銘柄, buy/skip/sell/hold) → (判断した日, 種類)
+    for d in await db.ai_decisions_since(week_start.date()):
+        for e in d["data"]["entries"]:
+            action = e.get("action")
+            if action in ("buy", "pass") and e.get("confidence") is not None:
+                kind = "buy" if _would_buy(d["owner"], d["data"], e) else "skip"
+                first.setdefault((d["owner"], e["ticker"], "entry"), (d["decided_on"], kind))
+            elif action in ("sell", "hold"):
+                first.setdefault((d["owner"], e["ticker"], action), (d["decided_on"], action))
+    sold = {(owner, ticker) for owner, ticker, side in first if side == "sell"}
+    daily = await market.get_daily(sorted({t for _, t, _ in first}), refresh=False) if first else {}
+    tallies = {owner: {k: Tally() for k in ("buy", "skip", "sell", "hold")} for owner in portfolio.AI_OWNERS}
+    for (owner, ticker, side), (day, kind) in first.items():
+        if side == "hold" and (owner, ticker) in sold:
+            continue  # 今週の途中で売った保有は、売る判断として数える
+        df = daily.get(ticker)
+        if df is None or df.empty or df.index[-1].date() <= day:
+            continue  # 判断した後の値動きがまだない
+        base = df[df.index.date <= day]["Close"]
+        if base.empty:
+            continue
+        tallies[owner][kind].add(float(df["Close"].iloc[-1] / base.iloc[-1] - 1))
+    return tallies
+
+
+TABLE_COLUMNS = ["", "その後上がった", "その後下がった", "上がった割合", "値動きの平均"]
+
+
+def _row(label: str, tally: Tally, up: tuple[str, bool], down: tuple[str, bool]) -> list[tuple[str, bool | None]]:
+    """表の 1 行。up・down は (上がった・下がったときの呼び名, それが正解か)。件数が 0 のマスには色を付けない。"""
+    return [
+        (label, None),
+        (f"{len(tally.up)} 件（{up[0]}）", up[1] if tally.up else None),
+        (f"{len(tally.down)} 件（{down[0]}）", down[1] if tally.down else None),
+        (f"{tally.up_rate:.0%}" if tally.count else "－", None),
+        (f"{tally.mean:+.1%}" if tally.count else "－", None),
+    ]
+
+
+def trade_table_sections(tallies: dict[str, dict[str, Tally]]) -> list:
+    """売買の振り返りの表（AI ごとに買い・売りの 2 つ）。"""
+    sections = []
+    for owner in portfolio.AI_OWNERS:
+        t, label = tallies[owner], portfolio.OWNER_LABELS[owner]
+        sections.append((f"{label}：今週の買い（判断した当時の基準で）", TABLE_COLUMNS, [
+            _row("買う判断（基準以上）", t["buy"], ("当たり", True), ("外れ", False)),
+            _row("見送り（基準未満）", t["skip"], ("見逃し", False), ("見送りで正解", True)),
+        ]))
+        sections.append((f"{label}：今週の売り", TABLE_COLUMNS, [
+            _row("売る判断", t["sell"], ("早すぎた", False), ("正解", True)),
+            _row("持ち続け", t["hold"], ("正解", True), ("売り遅れ", False)),
+        ]))
+    return sections
+
+
+def buy_verdict(t: dict[str, Tally]) -> str:
+    """確信度で、上がる銘柄と上がらない銘柄を見分けられていたか。"""
+    buy, skip = t["buy"], t["skip"]
+    if not (buy.count or skip.count):
+        return "買うかどうかを判断した候補はありません"
+    if not buy.count:
+        missed = f" {skip.count} 件のうち {len(skip.up)} 件は上がっていた（見逃し）" if skip.up else "候補はどれも上がらず、見送りで正解でした"
+        return f"買う判断の候補はなし。見送った{missed}"
+    if not skip.count:
+        return "見送った候補はなし"
+    if min(buy.count, skip.count) < VERDICT_MIN:
+        return f"件数が少ない（{VERDICT_MIN} 件未満）ので、確信度で見分けられているかは判定しません"
+    if buy.up_rate - skip.up_rate >= SAME_RATE:
+        return "買う判断のほうが上がった割合が高く、確信度で見分けられています"
+    if skip.up_rate - buy.up_rate >= SAME_RATE:
+        return "見送ったほうが上がった割合が高く、確信度が逆に働いています"
+    return "買う判断と見送りで上がった割合がほぼ同じで、確信度で見分けられていません"
+
+
+def sell_verdict(t: dict[str, Tally]) -> str:
+    """売った銘柄が、持ち続けた銘柄よりその後に上がっていなければ、売り時は合っている。"""
+    sell, hold = t["sell"], t["hold"]
+    if not (sell.count or hold.count):
+        return "保有はありません"
+    if not sell.count:
+        late = f" {hold.count} 件のうち {len(hold.down)} 件は下がっていた（売り遅れ）" if hold.down else "銘柄はどれも上がっていました"
+        return f"売った銘柄はなし。持ち続けた{late}"
+    if not hold.count:
+        return "持ち続けた銘柄はなし"
+    if min(sell.count, hold.count) < VERDICT_MIN:
+        return f"件数が少ない（{VERDICT_MIN} 件未満）ので、売り時が合っているかは判定しません"
+    if hold.up_rate - sell.up_rate >= SAME_RATE:
+        return "売った銘柄のほうがその後上がった割合が低く、売り時は合っています"
+    if sell.up_rate - hold.up_rate >= SAME_RATE:
+        return "売った銘柄のほうがその後上がった割合が高く、売るのが早すぎる傾向です"
+    return "売った銘柄と持ち続けた銘柄で、その後に上がった割合がほぼ同じです"
+
+
+@dataclass
+class TeamPnl:
+    total: list[float]  # 日ごとの入金額からの損益
+    stocks: dict[str, tuple[str, list[float]]]  # 銘柄コード → (銘柄名, 日ごとの損益)
+
+
+async def pnl_history(started_on) -> tuple[list, dict[str, TeamPnl]]:
+    """勝負を始めた日からの、チームごとの損益と銘柄ごとの損益（時価 − 差し引きで払った金額）の推移。"""
+    settings = await db.get_all_settings()
+    start_holdings = portfolio.start_holdings(settings)
+    dates: list = []
+    teams: dict[str, TeamPnl] = {}
+    for team in battle.TEAMS:
+        h = await dashboard.history_data(team, max_tickers=None)
+        all_dates = [datetime.fromisoformat(x).date() for x in h["dates"]]
+        keep = [i for i, d in enumerate(all_dates) if d >= started_on]
+        dates = [all_dates[i] for i in keep]
+        trades = await db.vp_trades(team)
+        pnl = TeamPnl([h["total"][i] - h["deposits"][i] for i in keep], {})
+        for t in h["tickers"]:
+            if t["ticker"].startswith("outside:") or not t["ticker"]:
+                continue  # ゲーム外の保有は取得額のままなので、損益は動かない
+            paid = []
+            for d in dates:
+                net = sum(s["cost"] for s in start_holdings if s["ticker"] == t["ticker"] and s["opened_on"] <= d)
+                for tr in trades:
+                    if tr["ticker"] != t["ticker"] or tr["traded_at"].astimezone(JST).date() > d:
+                        continue
+                    if tr["side"] == "buy":
+                        net += tr["amount"] + tr["fee"]
+                    else:
+                        net -= tr["amount"] - tr["fee"] - tr["tax"]
+                paid.append(net)
+            pnl.stocks[t["ticker"]] = (t["name"], [t["values"][i] - p for i, p in zip(keep, paid)])
+        teams[team] = pnl
+    return dates, teams
+
+
+def _week_base(dates: list, week_start: datetime) -> int:
+    """今週の増減を測る起点（先週最後の日。勝負を今週始めたなら最初の日）の位置。"""
+    before = [i for i, d in enumerate(dates) if d < week_start.date()]
+    return before[-1] if before else 0
+
+
+def week_movers(dates: list, pnl: TeamPnl, week_start: datetime) -> list[tuple[str, float, float]]:
+    """今週の損益の増減が大きかった銘柄: (銘柄名, 今週の増減, 通算の損益)。"""
+    base = _week_base(dates, week_start)
+    rows = []
+    for name, series in pnl.stocks.values():
+        change = series[-1] - series[base]
+        if abs(change) >= 1:
+            rows.append((name, change, series[-1]))
+    return sorted(rows, key=lambda r: abs(r[1]), reverse=True)
+
+
+async def weekly_ai_review(
+    now: datetime, adjustments: list[thresholds.Adjustment] | None = None
+) -> tuple[list[discord.Embed], dict[str, io.BytesIO]]:
+    """振り返りスレッドに添える 2 つの埋め込みと、その画像（ファイル名 → PNG）。
+
+    1 つ目は AI の売買の振り返り（表の画像）と買いの基準の自動の見直し、2 つ目は 3 チームの損益の推移（銘柄ごと）。
+    """
+    week_start = _week_start(now)
+    images: dict[str, io.BytesIO] = {}
+    review = discord.Embed(title="🔍 AI の今週の売買の振り返り", color=discord.Color.blurple())
+    tallies = await trade_review(week_start)
+    for owner in portfolio.AI_OWNERS:
+        value = f"買い：{buy_verdict(tallies[owner])}\n売り：{sell_verdict(tallies[owner])}"
+        review.add_field(name=f"{portfolio.OWNER_ICONS[owner]} {portfolio.OWNER_LABELS[owner]}", value=value[:1024], inline=False)
+    if adjustments:
+        lines = [a.text() for a in adjustments]
+        name = f"🔧 売買の基準の自動の見直し（直近 {thresholds.WINDOW_DAYS // 7} 週間・{thresholds.HORIZON} 営業日後の値動きを日経平均と比べて）"
+        review.add_field(name=name, value="\n".join(lines)[:1024], inline=False)
+    images["trades.png"] = await asyncio.to_thread(charts.trade_tables, trade_table_sections(tallies))
+    review.set_image(url="attachment://trades.png")
+    review.set_footer(
+        text="1 週間分なので参考程度です。値動きは判断した日の終値から直近の終値まで（税金・手数料を含めない）。"
+        "売る判断には損切りなどのルールで売ったものも含めます。基準は /threshold で確認・変更できます"
+    )
+
+    pnl_embed = discord.Embed(title="📈 3 チームの損益の推移", color=discord.Color.blurple())
+    settings = await db.get_all_settings()
+    started_on = datetime.fromisoformat(settings["vp_started_at"]).astimezone(JST).date()
+    dates, teams = await pnl_history(started_on)
+    for team in battle.TEAMS:
+        pnl = teams[team]
+        lines = []
+        if dates:
+            week = pnl.total[-1] - pnl.total[_week_base(dates, week_start)]
+            lines.append(f"通算 {pnl.total[-1]:+,.0f} 円 ・ 今週 {week:+,.0f} 円")
+        movers = week_movers(dates, pnl, week_start)
+        for stock, change, total in movers[:MAX_PNL_STOCKS]:
+            lines.append(f"{_arrow(change)} {stock}: 今週 {change:+,.0f} 円（通算 {total:+,.0f} 円）")
+        if len(movers) > MAX_PNL_STOCKS:
+            lines.append(f"ほか {len(movers) - MAX_PNL_STOCKS} 銘柄")
+        name = f"{portfolio.OWNER_ICONS[team]} {portfolio.OWNER_LABELS[team]}"
+        pnl_embed.add_field(name=name, value="\n".join(lines)[:1024] or "データがありません", inline=False)
+    if len(dates) >= 2:
+        # 3 チーム共通の初期の保有は、差がつかないうえに目盛りを占めてしまうので、銘柄ごとのグラフからは除く
+        common = {h["ticker"] for h in portfolio.start_holdings(settings)}
+        series = {
+            portfolio.OWNER_LABELS[t]: (teams[t].total, [s for code, s in teams[t].stocks.items() if code not in common])
+            for t in battle.TEAMS
+        }
+        images["pnl.png"] = await asyncio.to_thread(charts.pnl_chart, dates, series, week_start.date())
+        pnl_embed.set_image(url="attachment://pnl.png")
+    return [review, pnl_embed], images
 
 
 BIG_MOVE = 0.03  # 大引けレポートで「なぜ動いた？」ボタンを付ける値動き

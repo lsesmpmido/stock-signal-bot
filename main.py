@@ -35,6 +35,7 @@ import portfolio
 import quiz
 import reports
 import signals
+import thresholds
 import views
 import watchlist
 from jev_client import CATEGORIES, JevJudge
@@ -790,7 +791,19 @@ class StockBot(ext_commands.Bot):
         week_start = reports._week_start(now)
         channel = await self._report_channel()
         embed = await reports.weekly_look_back(now)
-        message = await channel.send(embed=embed)
+        embeds, files = [embed], []
+        adjustments = None
+        try:
+            adjustments = await thresholds.auto_adjust(now)
+        except Exception:  # 見直せなくても、今の基準のまま振り返りは送る
+            log.exception("AI の売買の基準の自動の見直しに失敗しました")
+        try:
+            review_embeds, images = await reports.weekly_ai_review(now, adjustments)
+            embeds += review_embeds
+            files += [discord.File(png, filename=name) for name, png in images.items()]
+        except Exception:  # おまけの欄なので、失敗しても振り返りは送る
+            log.exception("AI の売買の振り返りと損益の推移の作成に失敗しました")
+        message = await channel.send(embeds=embeds, files=files)
         name = f"📝 今週の振り返り（{week_start:%m/%d}〜{now - timedelta(days=1):%m/%d}）"
         try:
             thread = await message.create_thread(name=name, auto_archive_duration=10080)

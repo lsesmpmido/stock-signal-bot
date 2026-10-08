@@ -213,6 +213,139 @@ def compare_chart(
     return _to_png(fig)
 
 
+# 色の役割を図の中で変えないよう、チームと銘柄でパレットの別の枠を使う（決まった順で割り当てる）
+TEAM_COLORS = ["#2a78d6", "#eb6834", "#1baf7a"]
+STOCK_COLORS = ["#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+OTHER_COLOR = "#a3a29c"
+WEEK_SHADE = "#efeeea"
+
+
+def _man_yen(v: float, _=None) -> str:
+    return f"{v / 10_000:+,.1f}".replace(".0", "") + "万" if v else "0"
+
+
+def pnl_chart(dates: list, teams: dict[str, tuple[list[float], list[tuple[str, list[float]]]]], week_start) -> io.BytesIO:
+    """チームごとの損益（上段）と、チームごとの銘柄別の損益（下段）の推移。今週の範囲に色を付ける。
+
+    teams は {チーム名: (日ごとの損益, [(銘柄名, 日ごとの損益), ...])}。
+    """
+    x = list(range(len(dates)))
+    week_x = next((i for i, d in enumerate(dates) if d >= week_start), len(dates))
+    # 銘柄の色は、どのチームの段でも同じ色になるよう、損益の大きい順に図全体で決める
+    finals: dict[str, float] = {}
+    for _, stocks in teams.values():
+        for name, values in stocks:
+            finals[name] = max(finals.get(name, 0.0), abs(values[-1]), max(abs(v) for v in values))
+    named = sorted(finals, key=finals.get, reverse=True)[: len(STOCK_COLORS)]
+    stock_color = {name: STOCK_COLORS[i] for i, name in enumerate(named)}
+
+    with plt.rc_context({"font.family": FONT_FAMILY}):
+        fig, axes = plt.subplots(
+            1 + len(teams), 1, figsize=(10, 3 + 2.6 * len(teams)), sharex=True,
+            gridspec_kw={"height_ratios": [1.3] + [1] * len(teams)},
+        )
+    fig.patch.set_facecolor(SURFACE)
+    team_axes = axes[1:]
+    for ax in team_axes[1:]:
+        ax.sharey(team_axes[0])
+
+    def style(ax, title: str, zero: bool = True) -> None:
+        ax.set_facecolor(SURFACE)
+        if week_x < len(dates):
+            ax.axvspan(week_x - 0.5, len(dates) - 0.5, color=WEEK_SHADE, zorder=0)
+        if zero:
+            ax.axhline(0, color=MUTED, linewidth=0.8, zorder=1)
+        ax.set_title(title, color=TEXT, fontsize=11, loc="left", fontfamily=FONT_FAMILY)
+        ax.grid(axis="y", color=GRID, linewidth=0.8)
+        for spine in ax.spines.values():
+            spine.set_color(GRID)
+        ax.tick_params(colors=MUTED, labelsize=9)
+        ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(_man_yen))
+
+    def legend(ax, ncol: int) -> None:
+        # 線に重ならないよう、グラフの右上の外（見出しと同じ高さ）に置く
+        ax.legend(loc="lower right", bbox_to_anchor=(1, 1), frameon=False, ncol=ncol, borderaxespad=0.2,
+                  prop={"family": FONT_FAMILY, "size": 9})
+
+    top = axes[0]
+    style(top, "入金額からの損益（網掛けは今週）", zero=False)  # 3 チームの差が見えるよう、0 を含めずに範囲を決める
+    for (team, (total, _)), color in zip(teams.items(), TEAM_COLORS):
+        top.plot(x, total, color=color, linewidth=2, label=team, zorder=3)
+        top.annotate(f"{total[-1]:+,.0f}円", (x[-1], total[-1]), xytext=(6, 0), textcoords="offset points",
+                     va="center", color=TEXT, fontsize=9)
+    legend(top, len(teams))
+
+    for ax, (team, (_, stocks)) in zip(team_axes, teams.items()):
+        style(ax, f"{team}：銘柄ごと（共通の初期保有を除く）")
+        other = [0.0] * len(dates)
+        has_other = False
+        for name, values in sorted(stocks, key=lambda s: named.index(s[0]) if s[0] in stock_color else len(named)):
+            if name in stock_color:
+                ax.plot(x, values, color=stock_color[name], linewidth=2, label=name, zorder=3)
+            else:
+                other = [o + v for o, v in zip(other, values)]
+                has_other = True
+        if has_other:
+            ax.plot(x, other, color=OTHER_COLOR, linewidth=2, label="その他", zorder=2)
+        if stocks:
+            legend(ax, 4)
+        else:
+            ax.text(0.5, 0.5, "初期の保有のほかに、売買した銘柄はありません", transform=ax.transAxes,
+                    ha="center", va="center", color=MUTED, fontsize=10, fontfamily=FONT_FAMILY)
+
+    step = max(1, len(dates) // 10)
+    axes[-1].set_xticks(x[::step])
+    axes[-1].set_xticklabels([f"{d:%m/%d}" for d in dates[::step]])
+    axes[-1].set_xlim(-0.5, len(dates) - 0.5 + max(1, len(dates) * 0.12))  # 終点の値を書く余白
+    fig.tight_layout()
+    return _to_png(fig)
+
+
+GOOD_CELL = "#e3f4ec"  # 正解のマス（文字でも「正解」などと書くので、色だけに頼らない）
+BAD_CELL = "#fbe5e4"  # 外れ・見逃し・売り遅れなどのマス
+HEADER_CELL = "#efeeea"
+
+
+def trade_tables(sections: list[tuple[str, list[str], list[list[tuple[str, bool | None]]]]]) -> io.BytesIO:
+    """売買の振り返りの表を縦に並べる。sections は (見出し, 列名, 行) の並び。
+
+    行は (文字, 良し悪し) のマスの並びで、良し悪しが True なら正解の色、False なら外れの色、None なら色なし。
+    """
+    rows_total = sum(len(rows) + 1 for _, _, rows in sections)
+    with plt.rc_context({"font.family": FONT_FAMILY}):
+        fig, axes = plt.subplots(
+            len(sections), 1, figsize=(10, 0.55 * rows_total + 0.6 * len(sections)),
+            gridspec_kw={"height_ratios": [len(rows) + 1 for _, _, rows in sections]},
+        )
+    fig.patch.set_facecolor(SURFACE)
+    for ax, (title, columns, rows) in zip(axes if len(sections) > 1 else [axes], sections):
+        ax.axis("off")
+        ax.set_title(title, color=TEXT, fontsize=12, loc="left", fontfamily=FONT_FAMILY, pad=6)
+        table = ax.table(
+            cellText=[[text for text, _ in row] for row in rows],
+            colLabels=columns,
+            cellLoc="center",
+            colLoc="center",
+            loc="upper center",
+            bbox=[0, 0, 1, 1],
+            colWidths=[0.2] + [0.8 / (len(columns) - 1)] * (len(columns) - 1),
+        )
+        table.auto_set_font_size(False)
+        for (r, c), cell in table.get_celld().items():
+            cell.set_edgecolor(GRID)
+            cell.get_text().set_fontfamily(FONT_FAMILY)
+            cell.get_text().set_fontsize(10.5)
+            cell.get_text().set_color(TEXT)
+            if r == 0:
+                cell.set_facecolor(HEADER_CELL)
+                cell.get_text().set_color(MUTED)
+                continue
+            good = rows[r - 1][c][1]
+            cell.set_facecolor(SURFACE if good is None else GOOD_CELL if good else BAD_CELL)
+    fig.tight_layout(h_pad=1.6)
+    return _to_png(fig)
+
+
 EDGE_STYLES = {1: (2.6, TEXT), 2: (1.8, MUTED), 3: (1.1, MUTED), 4: (0.8, GRID)}  # 関係の優先度ごとの (線の太さ, 色)
 
 

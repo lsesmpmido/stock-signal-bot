@@ -62,11 +62,12 @@ class Mode:
         return round(self.sell_threshold + NISA_SELL_MARGIN, 2)
 
 
+# 買いの基準は、Jev の「買う」の確信度の実際の範囲（ほとんどが 0.25〜0.50）に合わせている
 MODES = {
-    "steady": Mode("steady", "🛡️ 堅実モード", 150_000, 0.75, 0.55, 0.10, 70, 0.15, take_profit=0.10),
-    "normal": Mode("normal", "😐 通常モード", 200_000, 0.65, 0.65, 0.10, 70, 0.15),
-    "apprentice": Mode("apprentice", "🥋 弟子モード", 200_000, 0.65, 0.65, 0.10, 70, 0.15, follow_you=True),
-    "gambler": Mode("gambler", "🎲 勝負師モード", 400_000, 0.55, 0.75, 0.25, 80, 0.30),
+    "steady": Mode("steady", "🛡️ 堅実モード", 150_000, 0.55, 0.55, 0.10, 70, 0.15, take_profit=0.10),
+    "normal": Mode("normal", "😐 通常モード", 200_000, 0.45, 0.65, 0.10, 70, 0.15),
+    "apprentice": Mode("apprentice", "🥋 弟子モード", 200_000, 0.45, 0.65, 0.10, 70, 0.15, follow_you=True),
+    "gambler": Mode("gambler", "🎲 勝負師モード", 400_000, 0.35, 0.75, 0.25, 80, 0.30),
 }
 
 

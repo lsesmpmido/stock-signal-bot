@@ -26,6 +26,7 @@ import orders
 import portfolio
 import review
 import signals
+import thresholds
 from jev_client import CATEGORIES, JevJudge
 from market import JST
 
@@ -62,6 +63,7 @@ class Mode:
         return round(self.sell_threshold + NISA_SELL_MARGIN, 2)
 
 
+# 買い・売りの基準は初期値。実際の判断では thresholds に保存した値（/threshold・毎週の見直し）を使う
 # 買いの基準は、Jev の「買う」の確信度の実際の範囲（ほとんどが 0.25〜0.50）に合わせている
 MODES = {
     "steady": Mode("steady", "🛡️ 堅実モード", 150_000, 0.55, 0.55, 0.10, 70, 0.15, take_profit=0.10),
@@ -241,6 +243,7 @@ def news_state(news: dict | None) -> dict | None:
 
 async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
     """今日の大引け後の判断をして、翌取引日の始値で約定する注文を出す。"""
+    mode = await thresholds.mode_with_settings(mode)  # 買い・売りの基準は、/threshold や毎週の見直しで変わる
     decisions = Decisions(mode)
     today = now.date()
     # 前日の売り注文がまだ約定していない銘柄は、見直しの対象から外す（売り注文の重複を防ぐ）

@@ -1063,6 +1063,16 @@ async def ai_unreported_decisions(before: date) -> list[dict[str, Any]]:
         ).fetchall()
 
 
+async def ai_decisions_since(since: date) -> list[dict[str, Any]]:
+    """since 以降の日の AI の判断（日付の古い順）。週末の振り返りで、買いの基準が適切だったかを調べるのに使う。"""
+    async with _pool_or_raise().connection() as conn:
+        return await (
+            await conn.execute(
+                "SELECT * FROM ai_decisions WHERE decided_on >= %s ORDER BY decided_on, owner", (since,)
+            )
+        ).fetchall()
+
+
 async def ai_mark_reported(owner: str, day: date) -> None:
     async with _pool_or_raise().connection() as conn:
         await conn.execute(

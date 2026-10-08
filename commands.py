@@ -1,4 +1,4 @@
-"""スラッシュコマンド: /settings, /watch add|remove|list|memo|star|tag, /alert add|list|remove, /buy, /sell, /portfolio, /orders, /battle, /deposit, /reset, /chart, /ranking, /compare, /related, /map, /sentiment, /review, /dashboard, /ask, /test proposal|signal|report"""
+"""スラッシュコマンド: /settings, /threshold, /watch add|remove|list|memo|star|tag, /alert add|list|remove, /buy, /sell, /portfolio, /orders, /battle, /deposit, /reset, /chart, /ranking, /compare, /related, /map, /sentiment, /review, /dashboard, /ask, /test proposal|signal|report"""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ import portfolio
 import reports
 import signals
 import review
+import thresholds
 import views
 import watchlist
 from jev_client import CATEGORIES
@@ -35,6 +36,46 @@ async def settings_command(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(
         views.settings_text(settings), view=views.SettingsView(settings), ephemeral=True
     )
+
+
+async def _threshold_text() -> str:
+    mode = await battle.current_mode()
+    lines = ["🎚️ **AI の売買の基準**（Jev の確信度がこれ以上なら売買する）"]
+    for spec, base, value in await thresholds.all_values():
+        if spec.auto:
+            lo, hi = base - thresholds.MAX_SHIFT, base + thresholds.MAX_SHIFT
+            note = f"毎週の自動の見直しの範囲 {lo:.0%}〜{hi:.0%}"
+        else:
+            note = "手動のみ"
+        current = " ← 今の性格" if spec.owner == "ai" and spec.key.startswith(f"{mode.key}_") else ""
+        lines.append(f"・{spec.label}: **{value:.0%}**（{note}）{current}")
+    lines.append(
+        f"買いの基準は、毎週土曜の振り返りで直近 {thresholds.WINDOW_DAYS // 7} 週間の判断から"
+        f" {thresholds.STEP * 100:.0f} ポイントずつ見直します。手動で変えると、その値が見直しの範囲の中心になります。"
+    )
+    return "\n".join(lines)
+
+
+@app_commands.command(name="threshold", description="AI の売買の基準（確信度）を表示・変更します")
+@app_commands.describe(target="変更する基準（省略すると一覧を表示）", percent="新しい基準（%）")
+@app_commands.choices(
+    target=[app_commands.Choice(name=s.label, value=f"{s.owner}:{s.key}") for s in thresholds.specs()]
+)
+@app_commands.default_permissions(manage_guild=True)
+async def threshold_command(
+    interaction: discord.Interaction,
+    target: app_commands.Choice[str] | None = None,
+    percent: app_commands.Range[int, 1, 99] | None = None,
+) -> None:
+    if target is None or percent is None:
+        head = "基準を変えるには、`target` と `percent` の両方を指定してください。\n\n" if target or percent else ""
+        await interaction.response.send_message(head + await _threshold_text(), ephemeral=True)
+        return
+    owner, key = target.value.split(":", 1)
+    before = await thresholds.current(owner, key)
+    await thresholds.set_manual(owner, key, percent / 100)
+    head = f"✅ {target.name} を {before:.0%} → **{percent}%** に変更しました（次の判断から使います）。\n\n"
+    await interaction.response.send_message(head + await _threshold_text(), ephemeral=True)
 
 
 async def _monitored_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -779,6 +820,7 @@ async def dashboard_command(interaction: discord.Interaction, action: app_comman
 def setup(tree: app_commands.CommandTree) -> None:
     for command in (
         settings_command,
+        threshold_command,
         WatchGroup(),
         AlertGroup(),
         TestGroup(),

@@ -23,6 +23,7 @@ import db
 import market
 import orders
 import portfolio
+import thresholds
 from jev_client import JevJudge
 from market import JST
 
@@ -39,6 +40,7 @@ MAX_WATCH = 30  # 場中に株価を見る候補の上限（yfinance の呼び�
 RISE_TRIGGER = 0.03  # 前日比がこれ以上ならきっかけ
 VOLUME_TRIGGER = 2.0  # 今日の出来高が 20 日平均のこの倍以上ならきっかけ
 NEWS_TRIGGER_DAYS = 1  # 提案からこの営業日数以内なら「新しい材料」
+# 基準は初期値。実際の判断では thresholds に保存した値（/threshold・毎週の見直し）を使う
 SHORT_THRESHOLD = 0.60  # 短期の確信度がこれ以上なら特定口座で買う
 LONG_THRESHOLD = 0.60  # 長期の確信度がこれ以上（かつ短期以上）なら NISA で買う
 TAKE_PROFIT = 0.06
@@ -47,14 +49,15 @@ TRAILING_STOP = 0.03  # 含み益が出た後、保有中の最高値からこ�
 MAX_SHORT_DAYS = 5  # 短期の保有の最長（営業日）
 LONG_SELL_THRESHOLD = 0.80  # 長期（NISA）の保有を、大引け後の Jev の「売る」の確信度がこれ以上なら売る（NISA の枠は売っても戻らないので高め）
 STYLE_LABELS = {"tokutei": "短期（特定口座）", "nisa": "長期（NISA）"}
-CRITERIA = (
-    f"買い: 短期の確信度 {SHORT_THRESHOLD:.0%} 以上（特定口座）・ 長期 {LONG_THRESHOLD:.0%} 以上（NISA） ・ "
-    f"長期の保有の売り: 確信度 {LONG_SELL_THRESHOLD:.0%} 以上"
-)
 
 
-def _empty_record() -> dict:
-    return {"mode": LABEL, "criteria": CRITERIA, "judged": 0, "asked": [], "entries": []}
+async def _empty_record() -> dict:
+    short, long_, long_sell = [await thresholds.current(OWNER, k) for k in ("short_buy", "long_buy", "long_sell")]
+    criteria = (
+        f"買い: 短期の確信度 {short:.0%} 以上（特定口座）・ 長期 {long_:.0%} 以上（NISA） ・ "
+        f"長期の保有の売り: 確信度 {long_sell:.0%} 以上"
+    )
+    return {"mode": LABEL, "criteria": criteria, "judged": 0, "asked": [], "entries": []}
 
 
 def _has_today(df: pd.DataFrame | None, today) -> bool:
@@ -137,7 +140,7 @@ async def run_slot(jev: JevJudge, now: datetime) -> list[orders.Executed]:
         return []
     today = now.date()
     stamp = f"{now:%H:%M}"
-    record = await db.ai_get_decisions(OWNER, today) or _empty_record()
+    record = await db.ai_get_decisions(OWNER, today) or await _empty_record()
     pending_sells = {o["ticker"] for o in await db.vp_orders("open", OWNER) if o["side"] == "sell"}
     positions = [p for p in await db.vp_positions(OWNER) if p["ticker"] not in pending_sells]
     candidates = list((await ai_trader.collect_candidates(now, OWNER)).values())[:MAX_WATCH]
@@ -215,6 +218,8 @@ async def _buy(
     settings = await db.get_all_settings()
     fee_rate = float(settings["vp_fee_rate"])
     nisa_left = await portfolio.nisa_room(OWNER, now)
+    short_threshold = await thresholds.current(OWNER, "short_buy")
+    long_threshold = await thresholds.current(OWNER, "long_buy")
 
     judged = []  # (候補, 口座 or None, 確信度, 短期, 長期, きっかけ)
     for c in candidates:
@@ -242,9 +247,9 @@ async def _buy(
             log.warning("Jev の買い判断（大胆 AI）に失敗: %s", c.ticker, exc_info=True)
             continue
         record["judged"] += 1
-        if long_ >= LONG_THRESHOLD and long_ >= short and nisa_left >= AMOUNT * 0.5:
+        if long_ >= long_threshold and long_ >= short and nisa_left >= AMOUNT * 0.5:
             judged.append((c, "nisa", long_, short, long_, found))
-        elif short >= SHORT_THRESHOLD and worth_it(short, fee_rate):
+        elif short >= short_threshold and worth_it(short, fee_rate):
             judged.append((c, "tokutei", short, short, long_, found))
         else:
             judged.append((c, None, max(short, long_), short, long_, found))
@@ -258,6 +263,8 @@ async def _buy(
             "name": c.name,
             "sources": [ai_trader.SOURCE_LABELS[s] for s in c.sources],
             "confidence": confidence,
+            "short": short,  # 毎週の基準の見直しに使う
+            "long": long_,
             "facts": f"短期 {short:.0%} ・ 長期 {long_:.0%} ・ きっかけ: {'、'.join(found)} ・ {ai_trader.facts(c.features)}",
         }
         if account is None:
@@ -305,7 +312,8 @@ async def _buy(
 async def after_close(jev: JevJudge, now: datetime) -> None:
     """大引け後: 長期（NISA）の保有を Jev で見直して翌取引日の始値で売る注文を出し、保有の状態を判断の記録に残す。"""
     today = now.date()
-    record = await db.ai_get_decisions(OWNER, today) or _empty_record()
+    record = await db.ai_get_decisions(OWNER, today) or await _empty_record()
+    long_sell_threshold = await thresholds.current(OWNER, "long_sell")
     pending_sells = {o["ticker"] for o in await db.vp_orders("open", OWNER) if o["side"] == "sell"}
     positions = [p for p in await db.vp_positions(OWNER) if p["ticker"] not in pending_sells]
     daily = await market.get_daily(sorted({p["ticker"] for p in positions}), refresh=False) if positions else {}
@@ -340,7 +348,7 @@ async def after_close(jev: JevJudge, now: datetime) -> None:
                 record["judged"] += 1
             except Exception:
                 log.warning("Jev の売り判断（大胆 AI）に失敗: %s", p["ticker"], exc_info=True)
-            if confidence is not None and confidence >= LONG_SELL_THRESHOLD:
+            if confidence is not None and confidence >= long_sell_threshold:
                 reason = "Jev の判断"
         if reason is None:
             record["entries"].append({**entry, "action": "hold", "confidence": confidence, "note": None})

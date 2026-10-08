@@ -40,19 +40,17 @@ async def settings_command(interaction: discord.Interaction) -> None:
 
 async def _threshold_text() -> str:
     mode = await battle.current_mode()
-    lines = ["🎚️ **AI の売買の基準**（Jev の確信度がこれ以上なら売買する）"]
+    lines = ["🎚️ **AI の売買の基準**（買い・売りは Jev の確信度、利益確定は含み益が、これ以上なら売買する）"]
     for spec, base, value in await thresholds.all_values():
-        if spec.auto:
-            lo, hi = base - thresholds.MAX_SHIFT, base + thresholds.MAX_SHIFT
-            note = f"毎週の自動の見直しの範囲 {lo:.0%}〜{hi:.0%}"
-        else:
-            note = "手動のみ"
+        lo, hi = base - thresholds.MAX_SHIFT, base + thresholds.MAX_SHIFT
+        note = f"毎週の自動の見直しの範囲 {lo:.0%}〜{hi:.0%}"
         current = " ← 今の性格" if spec.owner == "ai" and spec.key.startswith(f"{mode.key}_") else ""
         lines.append(f"・{spec.label}: **{value:.0%}**（{note}）{current}")
     lines.append(
-        f"買いの基準は、毎週土曜の振り返りで直近 {thresholds.WINDOW_DAYS // 7} 週間の判断から"
-        f" {thresholds.STEP * 100:.0f} ポイントずつ見直します。手動で変えると、その値が見直しの範囲の中心になります。"
+        f"どの基準も、毎週土曜の振り返りで直近 {thresholds.WINDOW_DAYS // 7} 週間の判断から"
+        f" 最大 {thresholds.MAX_STEP * 100:.0f} ポイント（1 ポイント刻み）見直します。手動で変えると、その値が見直しの範囲の中心になります。"
     )
+    lines.append("変えるには `/threshold target:（基準を選ぶ） percent:（数字）` と入力します。例: `percent:42` で 42%")
     return "\n".join(lines)
 
 

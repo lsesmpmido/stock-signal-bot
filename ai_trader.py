@@ -243,6 +243,7 @@ def news_state(news: dict | None) -> dict | None:
 
 async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
     """今日の大引け後の判断をして、翌取引日の始値で約定する注文を出す。"""
+    carried = await thresholds.carry_over(mode)  # 性格が変わったとき、性格の向きと逆の基準なら前の性格の基準を引き継ぐ
     mode = await thresholds.mode_with_settings(mode)  # 買い・売りの基準は、/threshold や毎週の見直しで変わる
     decisions = Decisions(mode)
     today = now.date()
@@ -415,6 +416,7 @@ async def decide(jev: JevJudge, mode: Mode, now: datetime) -> Decisions:
             "buy_threshold": mode.buy_threshold,
             "sell_threshold": mode.sell_threshold,
             "nisa_sell_threshold": mode.nisa_sell_threshold,
+            "threshold_note": carried,
             "judged": decisions.judged,
             "entries": decisions.log,
         },
@@ -436,7 +438,13 @@ def _decision_log(decisions: Decisions, holdings: dict[str, HoldingView], candid
     sold = {h.ticker: (reason, confidence) for h, _, reason, confidence in decisions.sells}
     for h in holdings.values():
         position = f"含み損益 {h.return_rate:+.1%} ・ 保有 {h.held_days} 営業日"
-        entry = {"ticker": h.ticker, "name": h.name, "facts": f"{position} ・ {facts(h.features)}"}
+        entry = {
+            "ticker": h.ticker,
+            "name": h.name,
+            "nisa": any(p["account"] == "nisa" for p in h.positions),  # 売りの基準の見直しに使う（NISA は基準が高い）
+            "return_rate": round(h.return_rate, 4),  # 利益確定のラインの見直しに使う
+            "facts": f"{position} ・ {facts(h.features)}",
+        }
         if h.ticker in sold:
             reason, confidence = sold[h.ticker]
             entries.append({**entry, "action": "sell", "confidence": confidence, "note": reason})

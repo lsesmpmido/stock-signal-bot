@@ -545,6 +545,8 @@ def ai_decisions_embed(record: dict) -> discord.Embed:
         f"持ち続け {len(holds)} ・ 見送り {len(passes)} ・ 安全ルールで除外 {len(blocked)} ・ Jev の判定 {data['judged']} 件\n"
         f"基準: {criteria}"
     )
+    if data.get("threshold_note"):
+        embed.description += f"\n🔁 {data['threshold_note']}"
     if not entries:
         embed.description += "\n\n保有も候補もありませんでした（候補は提案銘柄・監視銘柄・あなたが買った銘柄）。"
 

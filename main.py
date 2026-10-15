@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from datetime import date, datetime, time, timedelta
@@ -205,8 +206,7 @@ class StockBot(ext_commands.Bot):
     # ------------------------------------------------------------ 起動・終了
 
     async def setup_hook(self) -> None:
-        # ホスティング環境によってはポートが開くまで起動完了とみなさないので、ヘルスチェック用サーバーを最初に起動する
-        await self._start_health_server()
+        # ヘルスチェック用サーバーは、ログインより前に main() で起動している
         await db.init()
         await self.refresh_master()
         self.jev = JevJudge()
@@ -1028,8 +1028,47 @@ async def main() -> None:
     if missing := [key for key in REQUIRED_ENV if not os.getenv(key, "").strip()]:
         raise SystemExit(f"環境変数が設定されていません: {', '.join(missing)}")
     bot = StockBot()
+    # ホスティング環境によってはポートが開くまで起動完了とみなさないので、ヘルスチェック用サーバーをログインより先に起動する。
+    # ログインを待っている間も「動いている」と判定され、再起動されない
+    await bot._start_health_server()
     async with bot:
-        await bot.start(os.environ["DISCORD_TOKEN"])
+        await login_with_retry(bot, os.environ["DISCORD_TOKEN"])
+        await bot.connect()
+
+
+LOGIN_RETRY_DEFAULT = 900  # 秒。回数制限でログインできず、待つ時間の指定もないときに待つ時間
+
+
+def _retry_after(exc: discord.HTTPException) -> float:
+    """回数制限（429）の応答から、待つべき秒数を読む。読めなければ LOGIN_RETRY_DEFAULT。"""
+    try:
+        if value := exc.response.headers.get("Retry-After"):
+            return float(value)
+    except (AttributeError, ValueError):
+        pass
+    if isinstance(exc.text, str) and '"retry_after"' in exc.text:
+        try:
+            return float(json.loads(exc.text)["retry_after"])
+        except (ValueError, KeyError, TypeError):
+            pass
+    return LOGIN_RETRY_DEFAULT
+
+
+async def login_with_retry(bot: StockBot, token: str) -> None:
+    """ログインする。Discord に回数制限でブロックされている（429）ときは、終了せずに待ってからやり直す。
+
+    終了すると実行環境がすぐ再起動し、ログインの失敗を繰り返して、ブロックがかえって長引くため。
+    """
+    while True:
+        try:
+            await bot.login(token)
+            return
+        except discord.HTTPException as exc:
+            if exc.status != 429:
+                raise
+            wait = max(60.0, _retry_after(exc))
+            log.warning("Discord に回数制限でブロックされているため、%.0f 秒待ってからログインし直します", wait)
+            await asyncio.sleep(wait)
 
 
 if __name__ == "__main__":
